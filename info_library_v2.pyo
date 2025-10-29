@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""
+info_library_v2.py
+A small modular library for storing notes, text blocks, or code fragments in JSON format.
+"""
+
+import json
+import os
+from datetime import datetime
+
+LIB_PATH = os.path.expanduser("~/immutable-gdscript-framework/info_library_data.json")
+
+def load_library():
+    if not os.path.exists(LIB_PATH):
+        return {}
+    with open(LIB_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_library(data):
+    with open(LIB_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+def add_entry(category, title, content):
+    data = load_library()
+    if category not in data:
+        data[category] = []
+    entry = {
+        "title": title,
+        "content": content,
+        "timestamp": datetime.now().isoformat()
+    }
+    data[category].append(entry)
+    save_library(data)
+    print(f"✅ Added entry '{title}' to category '{category}'.")
+
+def list_entries(category=None):
+    data = load_library()
+    if not data:
+        print("📂 Library is empty.")
+        return
+    if category:
+        entries = data.get(category, [])
+        if not entries:
+            print(f"⚠️ No entries in category '{category}'.")
+            return
+        print(f"=== Entries in '{category}' ===")
+        for e in entries:
+            print(f"- {e['title']} ({e['timestamp']})")
+    else:
+        print("=== All Categories ===")
+        for cat in data.keys():
+            print(f"- {cat} ({len(data[cat])} items)")
+
+def view_entry(category, title):
+    data = load_library()
+    entries = data.get(category, [])
+    for e in entries:
+        if e["title"] == title:
+            print(f"\n📖 {e['title']} ({e['timestamp']})\n{'-'*40}\n{e['content']}\n")
+            return
+    print(f"❌ Entry '{title}' not found in '{category}'.")
+
+def delete_entry(category, title):
+    data = load_library()
+    if category in data:
+        new_entries = [e for e in data[category] if e["title"] != title]
+        if len(new_entries) < len(data[category]):
+            data[category] = new_entries
+            save_library(data)
+            print(f"🗑️ Deleted '{title}' from '{category}'.")
+            return
+    print(f"❌ No matching entry found.")
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: info_library_v2.py [add|list|view|delete] ...")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    if cmd == "add" and len(sys.argv) >= 5:
+        add_entry(sys.argv[2], sys.argv[3], " ".join(sys.argv[4:]))
+    elif cmd == "list":
+        category = sys.argv[2] if len(sys.argv) > 2 else None
+        list_entries(category)
+    elif cmd == "view" and len(sys.argv) >= 4:
+        view_entry(sys.argv[2], sys.argv[3])
+    elif cmd == "delete" and len(sys.argv) >= 4:
+        delete_entry(sys.argv[2], sys.argv[3])
+    else:
+        print("Invalid command or arguments.")
