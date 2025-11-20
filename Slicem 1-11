@@ -1,0 +1,1614 @@
+Slice 1 — Tape Schema v1.0 (Deterministic Input Tape)
+(Fully expanded, single sealed module. You hold the gate.)
+0) Scope & Dependencies
+In-scope: The normative, canonical format for exogenous inputs (“the tape”) that drive deterministic execution: user/device events, network payloads, scripted injections, and time-as-data. This slice defines field names, types, ordering, hashing, error handling, and acceptance checks.
+Out-of-scope (deferred): Domain-separation registry details (DSR), effect ontology specifics, key lifecycle, redaction/attestation. We reference their IDs where needed but do not define them here.
+Depends on (already established):
+• Canonical serialization (sorted keys, UTF-8, stable numerics) via your encoder_id.
+• Sealed ABI and parity tuple (this tape is an input to that machinery).
+• RNG domain policy (we reference rng_domain_id; full catalog is a later slice).
+Stability note: This slice does not change determinism, parity composition, effect containment, or upgrade rules. It only standardizes the shape of inputs the core consumes.
+1) Why a tape at all (one paragraph)
+The tape is the only legal bridge from the physical/interactive world into the pure state transition function. Everything exogenous—keystrokes, controller motion, “time passing,” inbound messages, seeded randomness—must appear here as data. Given {pre_root, tape_segment}, any conforming interpreter/staged artifact must produce identical {post_root, parity}. No ambient clocks, no hidden IO.
+2) Normative concepts
+• Tick: A discrete logic index t ∈ ℕ (0-based). The core advances strictly tick-by-tick. Time is represented as events on the tape, not by reading a clock.
+• Event: An indivisible record with tick, kind, source, payload, and identity metadata.
+• Segment: A contiguous window of events (tick ∈ [T0, T1)), used for streaming/lockstep.
+• Stream: A labeled subsequence of events sharing a source (e.g., keyboard/0, net/arena).
+• RNG stream: A named, content-addressed sequence of random values produced outside the core and injected via tape.
+3) Canonical envelope objects
+3.1 Tape Manifest
+A tape is a CAS object tape.manifest.json:
+{ "schema": "tape.v1.0", "encoder_id": "…", // canonical JSON spec id you already use "tape_id": "…", // see §6 hashing "rng_domain_id": "…", // catalog of RNG domains & substreams "created_by": { "operator_id": "…", // optional signer identity "tool_fingerprint": "…" // build/toolchain hash if relevant }, "bounds": { "tick_min": 0, "tick_max": 12345 }, "streams": [ {"name":"keyboard/0","events":"cas://…"}, {"name":"pointer/0","events":"cas://…"}, {"name":"net/arena","events":"cas://…"}, {"name":"rng/balance_ai","events":"cas://…"}, {"name":"time","events":"cas://…"} ], "signatures": [ /* optional: operator or judge signatures */ ] } 
+Each streams[i].events points to a stream file (CAS).
+3.2 Stream file (events array, canonical)
+One CAS object per stream:
+{ "schema": "tape.stream.v1.0", "name": "keyboard/0", "events": [ /* array of Event objects, sorted; see §4 */ ], "stream_id": "…", // §6 hashing "range": { "tick_min": 100, "tick_max": 200 }, "stats": { "count": 37 } } 
+4) Event object (normative schema)
+4.1 Common envelope (all events)
+{ "tick": 1234, // integer, ≥0 "ord": 2, // integer, tie-breaker within same tick (≥0) "kind": "key.down", // see §4.2 "source": "keyboard/0", // stream name "actor": "p1", // optional logical actor id "payload": { /* kind-specific */ } } 
+Ordering rule: Events are applied in lexicographic order by (tick, ord, kind, source) after canonicalizing strings (lowercase ASCII). There must be no duplicate (tick,ord,kind,source,payload) entries.
+Validity: tick must be within the tape’s manifest bounds; ord must be strictly increasing per tick, source.
+4.2 Event kinds (v1.0 catalog)
+(Each kind defines its payload schema. Numeric units are fixed; all strings lowercase ASCII.)
+A) User input
+• key.down / key.up
+payload:
+{"code":"key_a","scan":30,"repeat":false,"mods":{"shift":false,"ctrl":false,"alt":false,"meta":false}} 
+• code: stable logical code (not layout text).
+• scan: hardware scancode (optional; 0 if unknown).
+• text.input
+payload:
+{"text":"é"} 
+• pointer.move
+payload:
+{"x": 0.5333, "y": 0.4125, "dx": -0.0010, "dy": 0.0030, "normalized": true} 
+• normalized=true means (x,y)∈[0,1]. If false, include w,h or device DPI fields (see below).
+• pointer.button
+payload:
+{"button":"left","state":"down"} 
+• touch.begin / touch.update / touch.end
+payload:
+{"id":1,"x":0.12,"y":0.88,"pressure":0.5,"normalized":true} 
+• gamepad.button
+payload:
+{"pad":0,"button":"south","state":"down"} 
+• gamepad.axis
+payload:
+{"pad":0,"axis":"lx","value":-0.35} 
+• wheel.scroll
+payload:
+{"dx":0,"dy":-120,"unit":"lines"} // or "pixels" 
+B) System/logic control
+• time.tick
+payload: {}
+Meaning: Marks that one logic step occurred. Every tick in the tape must have exactly one time.tick event in the time stream.
+• window.resize (headless usually absent)
+payload:
+{"w":1920,"h":1080,"dpi":160} 
+• focus.change (UI contexts)
+payload:
+{"state":"gained"} // or "lost" 
+C) Network/application data
+• net.recv
+payload:
+{"chan":"arena","from":"peer42","content_cas":"cas://…","content_len":1024,"content_hash":"sha256:…"} 
+Content itself is stored in CAS; tape carries reference + metadata.
+• script.inject (deterministic scripted inputs)
+payload:
+{"name":"spawn_wave","args":{"count":10,"seed":"rng/balance_ai:42"}} 
+D) RNG injection
+• rng.next
+payload: {"stream":"rng/balance_ai","count":4,"values_cas":"cas://…","distribution":"u32"} Values are a CAS blob of fixed-endian integers. See §5 for rules.
+Extensibility: New kinds must be registered (future slice: DSR). Unrecognized kinds are invalid (see §9).
+5) RNG as tape (no hidden randomness)
+• All randomness consumed by the core must be supplied via rng.next events (or via high-level events that reference a seeded substream).
+• RNG streams are named: rng/<domain>[:substream_id]. The domain (e.g., balance_ai, loot, path_shuffle) comes from rng_domain_id (catalog).
+• Consumption discipline: The core must consume exactly the number and type of values declared by tape order. Any mismatch (shortage or extra consumption) is a deterministic error.
+• Types: distribution ∈ {u32,u64,f32_unit,f64_unit,bytes}. The CAS blob encodes exactly count items in big-endian (numbers) or raw bytes.
+Invariant: Two hosts that read the same rng.next sequences will produce identical sampled values and therefore identical post-roots (assuming same code/ABI/policy).
+6) Hashing & IDs (tape/stream/event)
+(This section references domain separation conceptually; concrete DSR tags will be listed in that future slice.)
+• Event hash event_id = H( tag_event_v1 || canonical(event_object) )
+• Stream hash stream_id = H( tag_stream_v1 || canonical({name, events[]}) )
+• Tape hash tape_id = H( tag_tape_v1 || canonical({schema, bounds, streams[].stream_id, rng_domain_id, encoder_id}) )
+Collision rules:
+• Any change to payload, ordering (tick/ord), kind, or source changes event_id, hence stream_id, hence tape_id.
+• The tape manifest is content-addressed by tape_id and stored in CAS.
+7) Ordering & determinism constraints
+• Monotone ticks: Stream events must satisfy tick_min ≤ tick ≤ tick_max.
+• Single time.tick per tick: The time stream contains exactly one time.tick for each tick in [bounds.tick_min, bounds.tick_max).
+• Within-tick order: For identical (tick, source), ord must strictly increase by 1 starting at 0.
+• Replay order: The interpreter merges all streams and applies events in (tick, ord, kind, source) order.
+• Idempotent merge: Multiple stream files that encode the same multiset and order of events must yield the same merged sequence.
+• No ambient time: The core never reads clocks; passage of time is represented only by time.tick and other tape events.
+8) Canonical numeric ranges & units
+• Coordinates: If normalized=true, positions are in [0.0, 1.0] inclusive; else include frame_w, frame_h in the payload to define device pixels.
+• Angles: Radians (float64) if ever introduced.
+• DPI/Hz: Integers.
+• All floats: IEEE-754 binary64 (JSON encoded as decimal strings with minimal form; no trailing zeros), per your encoder_id.
+9) Errors & deterministic reason codes
+A conforming verifier or interpreter must reject a tape/segment with a deterministic code:
+• TAPE_E_SCHEMA — unknown or unsupported schema.
+• TAPE_E_ENCODER — incompatible encoder_id.
+• TAPE_E_ORDER — non-monotonic ord within a tick, source.
+• TAPE_E_BOUNDS — event tick outside manifest bounds.
+• TAPE_E_TIME_DUP — missing or duplicate time.tick at any tick.
+• TAPE_E_KIND_UNKNOWN — event kind not in catalog v1.0.
+• TAPE_E_PAYLOAD — payload missing required fields or out-of-range.
+• TAPE_E_RNG_SHORTAGE — core requested more RNG than provided.
+• TAPE_E_RNG_EXCESS — RNG provided but not consumed.
+• TAPE_E_NET_REF — net.recv references CAS object with mismatched length/hash.
+• TAPE_E_HASH — stream_id/tape_id mismatch after canonicalization.
+(A global error catalog slice will later fix numeric codes; names are stable here.)
+10) Interop mapping (Godot & headless logic)
+• Keyboard/gamepad/pointer/touch map 1:1 to Godot input semantics; mapping tables from device scancodes to code are deterministic and must be referenced by hash (future “Input Map” slice).
+• time.tick stands for the fixed logic step—exactly one per tick. Rendering/audios are not in tape.
+• Network: Only received content appears on tape (net.recv references CAS). Outbound sends are app effects, not tape items.
+• RNG: Systems that previously used rand() must read from the designated RNG stream in a fixed order, documented by the program’s effect spec (future slice for RNG discipline in code).
+11) Examples (illustrative, canonicalized)
+11.1 Minimal three-tick tape (keyboard + time)
+Stream time:
+{ "schema":"tape.stream.v1.0", "name":"time", "events":[ {"tick":0,"ord":0,"kind":"time.tick","source":"time","actor":"sys","payload":{}}, {"tick":1,"ord":0,"kind":"time.tick","source":"time","actor":"sys","payload":{}}, {"tick":2,"ord":0,"kind":"time.tick","source":"time","actor":"sys","payload":{}} ] } 
+Stream keyboard/0:
+{ "schema":"tape.stream.v1.0", "name":"keyboard/0", "events":[ {"tick":1,"ord":0,"kind":"key.down","source":"keyboard/0","actor":"p1", "payload":{"code":"key_a","scan":30,"repeat":false,"mods":{"shift":false,"ctrl":false,"alt":false,"meta":false}}}, {"tick":2,"ord":0,"kind":"key.up","source":"keyboard/0","actor":"p1", "payload":{"code":"key_a","scan":30,"repeat":false,"mods":{"shift":false,"ctrl":false,"alt":false,"meta":false}}} ] } 
+Manifest (sketch):
+{ "schema":"tape.v1.0", "encoder_id":"…", "tape_id":"…", "rng_domain_id":"rng.domains.v1:…", "bounds":{"tick_min":0,"tick_max":3}, "streams":[ {"name":"time","events":"cas://…"}, {"name":"keyboard/0","events":"cas://…"} ] } 
+11.2 RNG stream sample
+Stream rng/balance_ai:
+{ "schema":"tape.stream.v1.0", "name":"rng/balance_ai", "events":[ {"tick":5,"ord":0,"kind":"rng.next","source":"rng/balance_ai","actor":"sys", "payload":{"stream":"rng/balance_ai","count":4,"values_cas":"cas://…","distribution":"u32"}} ] } 
+12) Acceptance checks (verifier POV)
+A tape (manifest + streams) is accepted iff:
+• Schema & encoder match supported versions; strings are valid UTF-8; numerics in range.
+• Per-stream ordering holds; ord increments correctly; tick within bounds.
+• Merged event sequence is strictly ordered by (tick, ord, kind, source) with no ties after canonicalization.
+• Time discipline: exactly one time.tick exists per tick in the manifest bounds.
+• RNG discipline: The program’s declared consumption (from code effect spec) exactly matches rng.next supplies, by order and type.
+• CAS references (net.recv, rng.next) resolve to objects whose length and hash match payload metadata.
+• Hash closure: Recomputing stream_ids and tape_id from canonical content yields the ids encoded in the objects.
+• No unknown kinds appear; all payloads pass schema validation.
+Failure => reject with a deterministic reason code from §9 and attach a minimal counterexample witness (the first offending event index and a short explanation).
+13) Operational guidance (non-normative but binding as practice)
+• Segmenting for multiplayer/streaming: Use segment manifests that cover tick ∈ [T, T+Δ), each segment independently content-addressed. tape_id becomes the Merkle root of segment ids (future slice: “Tape Merkle”).
+• Signatures: If tournaments or judges sign tapes, signatures attach to the manifest and include tape_id and a short declaration (who recorded, time window as narrative, not semantic).
+• Compression: Stream files may be stored compressed in CAS (e.g., zstd) but canonical bytes for hashing are the uncompressed canonical JSON.
+14) Edge cases & corner rules
+• Empty ticks: Allowed; a tick can have only time.tick and nothing else.
+• Simultaneous inputs: Resolve by ord. Producers must choose a stable order; verifiers do not reorder.
+• Pointer normalization drift: If normalized=false, must include frame_w and frame_h in payload. Mixing normalized and pixel streams is allowed; the consumer decides projection (declared in program spec).
+• Device variance: Different devices may produce different streams, but once recorded to tape, any conforming host replays identically.
+• Unknown optional fields: Disallowed in payload (to keep hashes stable); allowed in manifest.created_by only.
+15) Interfaces & IDs coined here
+• schema: "tape.v1.0" — this tape manifest format.
+• schema: "tape.stream.v1.0" — this stream format.
+• tape_id / stream_id / event_id — derived per §6.
+• rng_domain_id — referenced; full catalog is a later slice.
+• Error names in §9 — stable identifiers; numeric mapping deferred to error-catalog slice.
+16) Verification impact & guarantees
+• Determinism preserved: Two engines given the same pre_root, program_hash, abi_id, policy_id, and this tape produce the same post_root and parity tuple.
+• Anti-cheat & audit: Lockstep compares tape_ids and per-tick parity; divergence pinpoints the first offending event or state write.
+• Portability: Tapes are OS/engine neutral; they re-play across Termux, proot, CI, and headless Godot builds identically.
+17) Minimal conformance tests (to accept this slice)
+• Ordering test: Construct streams with intentionally misordered ord—expect TAPE_E_ORDER.
+• Time coverage test: Omit a time.tick at tick=10—expect TAPE_E_TIME_DUP.
+• RNG mismatch test: Provide count=3 but consumer reads 4—expect TAPE_E_RNG_SHORTAGE.
+• CAS reference test: net.recv references a blob with wrong content_len—expect TAPE_E_NET_REF.
+• Hash closure test: Edit one event byte; recompute stream_id mismatch—expect TAPE_E_HASH.
+End of Slice 1.
+When you say continue, I’ll proceed to the next small, fully expanded module (recommended next: RNG Domains Catalog v1.0 or Domain-Separation Registry v1.0, since both dovetail directly into this tape).
+
+Slice 2 — RNG Domains Catalog v1.0
+(Fully expanded, single sealed module. Builds directly on Tape Schema v1.0. You hold the gate.)
+0) Scope & Dependencies
+In-scope: A normative catalog that names, defines, and constrains RNG domains and substreams used by tapes. It specifies the allowed distributions, the naming grammar, independence guarantees (by domain separation, not statistics), and the validation rules verifiers apply when checking rng.next events.
+Out-of-scope (deferred):
+• Global Domain-Separation Registry (DSR) master table (this slice uses local tags and will cite the DSR when it exists).
+• Program-side “RNG ledger” mapping code call-sites to domains (that mapping is a later slice in the Effects/Program Spec).
+• Any PRNG algorithm. Tape remains the source of truth for values (via CAS). We may later add an optional “derivable RNG” extension; not here.
+Depends on:
+• Tape Schema v1.0 (§4.2.D and §5 in Slice 1).
+• Canonical serialization (encoder_id).
+• Parity invariants (unchanged by this slice).
+Stability note: This slice does not alter tape semantics. It only standardizes how RNG streams are named and validated and what distributions are allowed. Parity, determinism, and effect containment remain unchanged.
+1) Purpose (one paragraph)
+RNG domains let you use randomness safely in a deterministic system by pinning where it may be consumed and how it appears on tape. Domains serve three roles: (1) a namespace that prevents accidental cross-use (“loot” numbers never fuel “path_shuffle”); (2) a contract for distribution & size of values per event; and (3) a ledger structure that lets verifiers prove that consumption exactly matches supply, in order, with no slop.
+2) Normative objects & IDs
+2.1 Catalog file
+The catalog is a CAS object rng.domains.json:
+{ "schema": "rng.domains.v1.0", "encoder_id": "…", "rng_domain_id": "…", // derived per §8 "distributions": [ {"name":"u32","bytes":4,"endianness":"be","range":[0,4294967295]}, {"name":"u64","bytes":8,"endianness":"be","range":[0,18446744073709551615]}, {"name":"f32_unit","bytes":4,"endianness":"be","range":[0.0,1.0],"ieee754":true}, {"name":"f64_unit","bytes":8,"endianness":"be","range":[0.0,1.0],"ieee754":true}, {"name":"bytes","bytes":1,"endianness":"na","range":[0,255]} ], "domains": [ { "name":"balance_ai", "description":"RNG for AI balance sampling (weights, tie-breaks).", "default_distribution":"u32", "substream_policy":"per_actor", // see §3.3 "constraints":{"max_batch":1024} }, { "name":"loot", "description":"RNG for loot tables and drop rolls.", "default_distribution":"u32", "substream_policy":"per_context", "constraints":{"max_batch":2048} }, { "name":"path_shuffle", "description":"Permutation & shuffle draws for pathing/ordering.", "default_distribution":"u32", "substream_policy":"per_context", "constraints":{"max_batch":4096} }, { "name":"procgen", "description":"Procedural content generation (e.g., map seeds).", "default_distribution":"u64", "substream_policy":"per_context", "constraints":{"max_batch":1048576} } ], "substream_policies":[ {"name":"per_actor","description":"Each logical actor (e.g., p1, npc42) uses a distinct substream id."}, {"name":"per_context","description":"Each named context (e.g., level_3, encounter_7) has a distinct substream id."}, {"name":"singleton","description":"One stream per domain; no substreams."} ], "naming_grammar":{ "domain_re":"^[a-z0-9_]+(?:\\.[a-z0-9_]+)*$", "sub_id_re":"^[a-z0-9_:-]{1,64}$", "stream_fmt":"rng/<domain>[:<substream_id>]" } } 
+You can extend domains[] as needed; this initial set illustrates typical use. Domain addition is append-only within a version.
+3) Naming & structure
+3.1 Domain names (canonical)
+• Lowercase ASCII, [a-z0-9_]+ components separated by . (dot) for hierarchy, e.g., ai.targeting, loot.rare.
+• Names are stable IDs inside the catalog; renaming a domain creates a new domain.
+3.2 Streams
+• A stream is addressed as: rng/<domain>[:<substream_id>].
+• Examples: rng/loot, rng/loot:boss_dragon, rng/balance_ai:p1, rng/procgen:level_3.
+3.3 Substreams
+• substream_id disambiguates independent consumption tracks within a domain according to the domain’s substream_policy: 
+• per_actor → substream_id must equal an actor id present in events (actor field, e.g., p1, npc42).
+• per_context → substream_id must be a declared context string in the program spec (later slice).
+• singleton → no substream_id allowed.
+Invariant: Distinct substreams are never merged; each constitutes its own tape stream file.
+4) Distributions (allowed types)
+• u32: 4-byte big-endian unsigned.
+• u64: 8-byte big-endian unsigned.
+• f32_unit: IEEE-754 binary32 encoded as big-endian bytes; semantic range [0.0,1.0].
+• f64_unit: IEEE-754 binary64 encoded as big-endian bytes; semantic range [0.0,1.0].
+• bytes: raw bytes (1-byte unit). count in rng.next equals number of bytes.
+Rule: The distribution named in rng.next.payload MUST match one entry in distributions[]. Values CAS length must equal count * distribution.bytes (except bytes, where it equals count).
+5) Independence model (domain separation, not statistics)
+• Independence is by construction: different domains (and substreams) must not share values or be derived from a common hidden pool. Since the tape supplies values explicitly, reuse across domains/substreams is a verifier error if detected (see §10).
+• No “random by the engine.” The core does not generate numbers; it consumes what the tape supplies.
+• No cross-talk: An event from rng/loot must not satisfy consumption in rng/balance_ai, even if the distribution matches.
+6) rng.next event contract (recap + domain rules)
+From Tape v1.0, an event:
+{ "tick": 5, "ord": 0, "kind": "rng.next", "source": "rng/loot:boss_dragon", "actor": "sys", "payload": { "stream": "rng/loot:boss_dragon", "count": 4, "values_cas": "cas://…", "distribution": "u32" } } 
+Additional catalog rules:
+• payload.stream must equal source.
+• The domain (loot) must exist in domains[].
+• If the domain uses per_actor, then either actor != null and substream_id == actor, or the program spec explicitly maps actors to substream ids (later slice).
+• The distribution must be equal to default_distribution unless the domain explicitly lists an allowed override list (optional extension).
+• count must be ≥ 1 and ≤ constraints.max_batch if present.
+• values_cas must point to a CAS blob whose length matches count * bytes (or count for bytes) and whose hash matches content_hash if present in future extensions.
+7) Stream & tape validation (catalog-aware)
+Given a tape referencing rng_domain_id, a verifier must:
+• Load the catalog by rng_domain_id and check schema:"rng.domains.v1.0".
+• Validate every RNG stream name against naming_grammar.stream_fmt; extract <domain> and optional <substream_id>.
+• Check domain existence and substream policy: 
+• singleton → no substream_id.
+• per_actor → substream_id corresponds to an actor or a declared mapping.
+• per_context → substream_id corresponds to a declared context (program spec slice).
+• Per-event checks: 
+• payload.stream == source.
+• distribution in distributions[]; equals domain’s default unless allowed overrides exist.
+• values_cas resolves to a blob with exact length.
+• Monotone consumption: The interpreter consumes values from this stream exactly in the sequence supplied by events; shortage/excess is an error (see §10).
+• Cross-domain reuse check (optional but recommended): Verify that no two distinct RNG events in the same tape reference the same values_cas and offset unless they belong to the same stream and are part of an explicit replay segment (future “Tape Merkle” slice). If re-use is detected across different streams → reject.
+8) IDs & hashing
+• rng_domain_id = H(tag_rng_catalog_v1 || canonical(rng.domains.json))
+• rng_stream_id (logical label) = H(tag_rng_stream_v1 || "<domain>[:<substream_id>]")
+• rng_event_id is just the tape event_id (from Slice 1).
+Note: We do not hash the actual RNG values into a “domain id”; values are already validated through the rng.next event’s values_cas. Catalog IDs are about structure and policy, not specific draws.
+9) Golden examples
+9.1 Valid — singleton domain
+Catalog includes:
+{"name":"procgen","default_distribution":"u64","substream_policy":"singleton"} 
+Valid stream names:
+• rng/procgen ✅
+• rng/procgen:level_3 ❌ (violates singleton)
+9.2 Valid — per_actor domain
+Catalog includes:
+{"name":"balance_ai","default_distribution":"u32","substream_policy":"per_actor"} 
+Valid events:
+• source: "rng/balance_ai:p1", actor:"p1" ✅
+• source: "rng/balance_ai:npc42", actor:"p1" ❌ unless program declares a mapping p1 ↔ npc42 (later slice).
+9.3 Distribution length check
+distribution:"f64_unit", count:3 ⇒ CAS length must be 3 * 8 = 24 bytes.
+10) Deterministic errors (reason names)
+A verifier must reject with one of:
+• RNG_E_CATALOG_SCHEMA — catalog has wrong/unsupported schema.
+• RNG_E_CATALOG_ENCODER — encoder mismatch for catalog.
+• RNG_E_DOMAIN_UNKNOWN — tape references rng/<domain> not present in catalog.
+• RNG_E_STREAM_FORMAT — stream name violates stream_fmt/regex.
+• RNG_E_SUBSTREAM_POLICY — substream_id violates domain’s policy.
+• RNG_E_DISTRIBUTION_UNKNOWN — distribution not declared in distributions[].
+• RNG_E_DISTRIBUTION_FORBIDDEN — distribution not allowed for this domain.
+• RNG_E_BATCH_SIZE — count exceeds domain max_batch or is zero.
+• RNG_E_VALUES_LEN — values_cas length mismatch for count and distribution size.
+• RNG_E_RNG_SHORTAGE — consumer requests more numbers than supplied (from Slice 1).
+• RNG_E_RNG_EXCESS — supplied numbers not consumed (from Slice 1).
+• RNG_E_REUSE — cross-domain/substream re-use of the same values blob/offset (if detected).
+• RNG_E_HASH — any hashed object mismatch.
+Each error should attach a minimal counterexample witness: offending event index, expected vs actual, and the resolved domain/substream context.
+11) Interaction with parity & effects
+• Parity unaffected: RNG values only affect state via program logic; tape supply guarantees determinism.
+• Effects unchanged: Domains do not alter the effect table; they only constrain where randomness is permitted to be consumed.
+• Auditing: A later slice (“RNG Ledger”) will provide expected consumption counts per tick by domain/substream so verifiers can check a priori budgets; not required here.
+12) Godot mapping (headless logic)
+• Replace in-engine random calls (e.g., randi, randf) with explicit consumption from the domain/substream designated in the program spec (later slice).
+• Example mapping: 
+• Combat AI tie-breaks → rng/balance_ai:<actor> (u32)
+• Loot drops → rng/loot:<encounter> (u32)
+• Procedural level gen → rng/procgen (u64)
+• Threading: Consumption order must be linearized deterministically (single-thread or a fixed scheduler transcript; outside this slice’s scope, but mandated by Slice 1).
+13) Edge cases & corner rules
+• Empty domain set: Allowed only if no rng.next events occur in the tape; otherwise RNG_E_DOMAIN_UNKNOWN.
+• Multiple catalogs in one EP: Allowed for historical runs, but each tape references one rng_domain_id.
+• Distribution upgrade: To change allowable distributions for a domain, version the catalog (new rng_domain_id) and ensure tapes reference the correct one.
+• Catalog extension: Adding new domains is backward-compatible; removing or renaming is not.
+• Unit floats: f32_unit and f64_unit must be in [0.0,1.0]. Values outside range → RNG_E_VALUES_LEN is not appropriate; use RNG_E_PAYLOAD (from Slice 1) for semantic out-of-range.
+14) Acceptance checks (verifier POV)
+A tape that references rng_domain_id is accepted w.r.t. RNG iff:
+• Catalog loads and hashes to rng_domain_id.
+• Every RNG stream name matches stream_fmt and maps to an existing domain; substream policy rules pass.
+• Every rng.next event’s distribution is declared and allowed for that domain.
+• Every values_cas resolves to exact-length blobs (count * bytes).
+• No cross-domain/substream re-use of identical value slices (if the verifier performs this check).
+• The program’s observed consumption exactly matches the supplied numbers in order (total counts align).
+Failure ⇒ reject with §10 reasons and attach the first offending event witness.
+15) Conformance vectors (minimal set to prove this slice)
+• Vector A: Valid catalog + tape with two domains (loot, balance_ai), each with two substreams; consumption matches supply. Expect accept.
+• Vector B: Invalid stream name rng/loot:Boss#1. Expect RNG_E_STREAM_FORMAT.
+• Vector C: per_actor domain used with substream_id=encounter_7 and actor=p1 (no declared mapping). Expect RNG_E_SUBSTREAM_POLICY.
+• Vector D: distribution:"u64", count:2, blob length 12 bytes. Expect RNG_E_VALUES_LEN.
+• Vector E: Two RNG events in different domains reference the same values_cas blob (identical hash and implied slice). Expect RNG_E_REUSE (if check enabled).
+• Vector F: Catalog updated to include procgen domain; old tape still accepted with old rng_domain_id; new tape must reference the new id.
+16) What this does not change (stability)
+• Does not introduce seeds or PRNGs into the core.
+• Does not alter Tape v1.0 event format (only validates it more strictly).
+• Does not change parity tuple or effect containment.
+• Does not mandate statistical tests; correctness is structural (supply=consumption, namespaces, lengths, orders).
+End of Slice 2.
+Say continue to proceed. Recommended next slice to dovetail: Domain-Separation Registry v1.0 (the global tag book), or Input Map v1.0 (deterministic scancode→code mapping referenced by key.* events).
+
+
+
+Slice 3 — Domain-Separation Registry (DSR) v1.0
+(Fully expanded, single sealed module. Builds on Slices 1–2. You hold the gate.)
+0) Scope & Dependencies
+In-scope: The normative, hash-pinned registry of domain-separation tags used whenever we derive content IDs (events, streams, proofs, manifests, parity tuples, etc.). It defines: naming, encoding, versioning, hashing prelude, validation rules, required tags for existing planes, error taxonomy, and conformance artifacts.
+Out-of-scope (deferred): Crypto agility policy (suite switching rules), full SBOM/attestations, and per-object schemas already defined in other slices. This registry does not choose a single hash algorithm; it defines how tags are bound regardless of suite.
+Depends on:
+• Canonical serialization (encoder_id) from your Foundation layer.
+• Tape v1.0 (Slice 1) and RNG Domains v1.0 (Slice 2).
+• Parity, capability, OML, staging, upgrade planes (we allocate tags for them, but do not redefine their schemas here).
+Stability note: Introducing the DSR does not change any object’s semantics or parity. It only standardizes the prefixing discipline so independently built tools compute the same IDs.
+1) Purpose (one paragraph)
+Domain separation guarantees that two different object kinds with identical bytes cannot collide when hashed. We accomplish this by prepending a DSR prelude—a sealed, versioned tag—before hashing canonical bytes. This is mandatory for every hashed artifact in the system. By fixing tags centrally, we prevent accidental reuse and make third-party verifiers interoperable.
+2) The Registry Object
+A registry lives as a CAS object ds.registry.json:
+{ "schema": "ds.registry.v1.0", "encoder_id": "…", "ds_registry_id": "…", // §6 hashing "label": "IMM/DSR/1.0 (Forest of Light)", "suites": ["blake3", "sha256"], // algorithms permitted by policy (not chosen here) "prelude_format": { "version": 1, "encoding": "ULEB128_len || UTF8(tag) || 0x00" // §4 }, "tags": [ { "name": "immu.tape.event.v1", "kind": "tape/event", "version": "v1", "notes": "Canonical envelope for a single event as in Tape v1.0" }, { "name": "immu.tape.stream.v1", "kind": "tape/stream", "version": "v1", "notes": "Stream file with ordered events" }, { "name": "immu.tape.manifest.v1", "kind": "tape/manifest", "version": "v1", "notes": "Top-level tape manifest" }, { "name": "immu.rng.catalog.v1", "kind": "rng/catalog", "version": "v1", "notes": "RNG Domains Catalog v1.0" }, { "name": "immu.parity.tuple.v1", "kind": "proof/parity", "version": "v1", "notes": "Strengthened parity tuple bytes before hashing" }, { "name": "immu.proof.txn.v1", "kind": "proof/txn_cert", "version": "v1", "notes": "Transaction cert bundle canonical bytes" }, { "name": "immu.proof.cap.v1", "kind": "proof/capability", "version": "v1", "notes": "Capability lineage proof" }, { "name": "immu.proof.oml.v1", "kind": "proof/oml", "version": "v1", "notes": "OML proofs (GLB/LUB/orthomodularity/context)" }, { "name": "immu.stage.artifact.v1", "kind": "staging/artifact", "version": "v1", "notes": "Sealed staged blob" }, { "name": "immu.upgrade.bundle.v1", "kind": "upgrade/bundle", "version": "v1", "notes": "Signed upgrade bundle manifest" }, { "name": "immu.pack.toc.v1", "kind": "storage/pack_toc", "version": "v1", "notes": "Packfile Merkle TOC canonical bytes" }, { "name": "immu.cdc.chunklist.v1", "kind": "storage/cdc", "version": "v1", "notes": "Content-defined chunk descriptor list" }, { "name": "immu.heal.cert.v1", "kind": "heal/cert", "version": "v1", "notes": "Self-heal certificate (storage-only repair)" }, { "name": "immu.instrument.profile.v1", "kind": "instr/profile", "version": "v1", "notes": "Instrumentation profile definition" }, { "name": "immu.instrument.pcv.v1", "kind": "instr/pcv", "version": "v1", "notes": "Physical Context Vector snapshot window" }, { "name": "immu.sched.event.v1", "kind": "sched/event", "version": "v1", "notes": "Scheduling decision proof record" }, { "name": "immu.gc.proof.v1", "kind": "storage/gc_proof", "version": "v1", "notes": "Reachability/closure proof for GC" }, { "name": "immu.mirror.closure.v1", "kind": "storage/mirror_closure", "version": "v1", "notes": "Mirror closure check report" }, { "name": "immu.ep.manifest.v1", "kind": "ep/manifest", "version": "v1", "notes": "Explainer Pack top manifest" }, { "name": "immu.redaction.manifest.v1", "kind": "ep/redaction", "version": "v1", "notes": "Selective disclosure manifest" } ] } 
+3) Naming & Versioning Rules
+• name grammar: immu.<plane>.<object>.v<major> where <plane> is one of: tape, rng, proof, staging, upgrade, storage, heal, instr, sched, ep.
+• Stability: Names are immutable once published; any incompatible change ⇒ new tag (increment v<major>).
+• Append-only: tags[] grows; entries are never removed/renamed.
+• Aliases: Disallowed. (Aliases create ambiguity for verifiers.)
+• Notes: Human-readable, non-normative; do not affect hashing.
+4) Prelude Encoding (normative)
+For any object kind with canonical bytes B, we compute its content ID by hashing:
+HashInput = P || B P = ULEB128(len(tag_utf8)) || tag_utf8 || 0x00 
+• tag_utf8 = the registry name (e.g., immu.tape.event.v1) in UTF-8.
+• ULEB128 length prevents collisions like ab|c vs a|bc.
+• The single 0x00 sentinel defends against accidental concatenation.
+• B must be encoded with the system’s encoder_id (canonical JSON or canonical binary), already established.
+Why ULEB128? It’s compact, unambiguous, and endian-free. Verifiers can read length deterministically.
+5) Hashing & Suites (algorithm-agnostic binding)
+• The DSR does not fix the hash suite; it defines how tags bind.
+• A content ID under suite S is H_S(HashInput).
+• Current permitted suites are listed in the registry (e.g., blake3, sha256). The crypto policy slice will dictate which suite(s) must appear in manifests and how migrations happen.
+• Same prelude across suites: The prelude is identical regardless of S.
+6) Registry ID & Integrity
+• ds_registry_id = H_S( ULEB128(len("immu.dsr.v1")) || "immu.dsr.v1" || 0x00 || canonical(registry_json) ) 
+• Here the tag string for the registry itself is fixed: immu.dsr.v1.
+• S must be a suite listed in suites. EP manifests can store multiple suite digests (multihash), each computed from the same prelude+bytes.
+Closure rule: A verifier must recompute ds_registry_id and reject if it does not match the claimed ID.
+7) Required Tag Mappings (retrofits for existing slices)
+Plane / ObjectTag nameNotesTape Event (Slice 1 §4)immu.tape.event.v1Replaces ad-hoc tag_event_v1Tape Stream (Slice 1 §3.2)immu.tape.stream.v1—Tape Manifest (Slice 1 §3.1)immu.tape.manifest.v1—RNG Domains Catalog (Slice 2)immu.rng.catalog.v1—Parity Tuple Bytesimmu.parity.tuple.v1Hash over concatenated fields (already defined elsewhere)Txn Certificate Bundleimmu.proof.txn.v1—Capability Proofimmu.proof.cap.v1—OML Proofimmu.proof.oml.v1—Staged Artifact Blobimmu.stage.artifact.v1—Upgrade Bundle Manifestimmu.upgrade.bundle.v1—Packfile TOCimmu.pack.toc.v1—CDC Chunk Listimmu.cdc.chunklist.v1—Self-Heal Certificateimmu.heal.cert.v1—Instrumentation Profileimmu.instrument.profile.v1—PCV Snapshotimmu.instrument.pcv.v1—Scheduling Eventimmu.sched.event.v1—GC Closure Proofimmu.gc.proof.v1—Mirror Closure Reportimmu.mirror.closure.v1—EP Manifestimmu.ep.manifest.v1—EP Redaction Manifestimmu.redaction.manifest.v1—Registry Itselfimmu.dsr.v1For ds_registry_id 
+Implementers must update earlier code paths to fetch tag strings from the DSR, not embed literals.
+8) Verifier Rules (how tags are checked)
+For any object X that declares an id (or …_id) and a tag name in this table:
+• Load DSR (by ds_registry_id) and confirm schema:"ds.registry.v1.0".
+• Resolve tag name to its canonical UTF-8.
+• Rebuild prelude via §4.
+• Canonicalize X’s bytes B using the claimed encoder_id.
+• Compute digest(s) under the suite(s) required by the crypto policy.
+• Compare to the claimed ID(s).
+• Reject on mismatch with deterministic reasons (§12).
+9) Tag Allocation Process (adding new kinds)
+• Propose: New tag proposal includes name, kind, version, notes, and pointers to the object’s normative schema slice.
+• Uniqueness: name must be unique; kind should map to a plane/object taxonomy entry.
+• Versioning: Breaking changes to canonical bytes ⇒ new v<N>.
+• Registration: Append to tags[]; recompute ds_registry_id.
+• Deprecation: Mark old tags as “deprecated” in an auxiliary list, but do not remove them.
+• Governance: The EP includes a signed change log of DSR updates.
+10) Extensibility & Crypto Agility Hooks
+• The suites field advertises permitted suites. The Crypto Policy slice will specify which suite(s) must appear in each context (e.g., both BLAKE3 and SHA-256 for dual-stack periods).
+• Prelude format is versioned (prelude_format.version). Any change to prelude encoding ⇒ new DSR major (e.g., ds.registry.v2.0 and immu.dsr.v2 tag for the registry itself). V1 prelude is forever stable.
+11) Golden Vector Harness (structure)
+This slice mandates a golden vector set stored under golden/dsr/v1/ in the EP:
+• 01_event.json — minimal Tape Event canonical bytes + tag = immu.tape.event.v1 → expected digests (per suite).
+• 02_stream.json — minimal Tape Stream + tag = immu.tape.stream.v1 → digests.
+• 03_manifest.json — minimal Tape Manifest + tag… → digests.
+• … corresponding vectors for all required tags in §7.
+• 00_registry.json — the registry itself with computed ds_registry_id digests.
+Format of each vector file:
+{ "tag": "immu.tape.event.v1", "suite": "blake3", "prelude_hex": "…", // ULEB128(len)||UTF8(tag)||00 "body_hex": "…", // canonical bytes of the object under test "digest_hex": "…" // expected H_s(prelude||body) } 
+This keeps vectors verifiable by any third party, offline.
+12) Deterministic Errors (reason names)
+• DSR_E_SCHEMA — registry schema unsupported.
+• DSR_E_ENCODER — registry encoder mismatch.
+• DSR_E_ID_MISMATCH — computed ds_registry_id ≠ claimed.
+• DSR_E_TAG_UNKNOWN — object claims a tag not present in DSR.
+• DSR_E_TAG_CONFLICT — duplicate or ambiguous tags in DSR.
+• DSR_E_PRELUDE_FMT — prelude could not be constructed per spec.
+• DSR_E_SUITE_UNALLOWED — digest computed under a suite not permitted by suites.
+• DSR_E_HASH_MISMATCH — object’s claimed id ≠ recomputed digest.
+• DSR_E_CANON_BYTES — object bytes not canonical per encoder_id.
+Each failure must attach a minimal witness: pointer to offending tag/object, the exact prelude built, and the first byte offset of mismatch where applicable.
+13) Edge Cases & Corner Rules
+• Multiple registries in an EP: Allowed for historical runs; each object must cite the exact ds_registry_id it used. Verifiers must load the referenced one.
+• Cross-suite IDs: Objects may carry multiple digests (e.g., blake3_id, sha256_id); each uses the same prelude.
+• Raw bytes objects: For non-JSON blobs (e.g., staged artifacts), B is the raw canonical binary; the DSR prelude still applies.
+• Out-of-band tags: Disallowed. If a tool uses an unregistered tag, verifiers must reject (DSR_E_TAG_UNKNOWN).
+• Tag drift: Changing notes is allowed; changing name/kind/version is not.
+14) Acceptance Checks (verifier POV)
+A DSR is accepted iff:
+• schema matches ds.registry.v1.0 and encoder_id is supported.
+• tags[] has no duplicates by name; every name matches the grammar; every version matches ^v[1-9][0-9]*$.
+• prelude_format equals the V1 spec here.
+• ds_registry_id recomputes exactly.
+• For a sample corpus (at least one object per tag in §7), recomputed IDs match the ones embedded in those objects (round-trip test).
+Failure ⇒ reject with §12 reasons.
+15) What this does not change (stability)
+• Does not modify any object’s schema or parity tuple composition.
+• Does not select a single crypto suite; it binds tags independent of the suite.
+• Does not introduce new runtime dependencies. It’s a spec and data object.
+End of Slice 3.
+Say continue to proceed. Recommended next slices that dovetail cleanly: Parity Tuple v1.1 (final, with field order & vectors) or Input Map v1.0 (deterministic scancode→code mapping for key.* events).
+
+
+Slice 4 — Parity Tuple v1.1 (Normative Execution Commitment)
+(Fully expanded, single sealed module. Builds on Slices 1–3. You hold the gate.)
+0) Scope & Dependencies
+In-scope: The normative definition of the execution commitment (“parity”) that both the interpreter and any staged artifact must produce bit-identically for the same inputs. This slice fixes: fields, canonical encoding, hashing (with DSR prelude), per-tick vs run-level parity, write-set digest definition, verifier rules, errors, and golden-vector requirements.
+Out-of-scope (deferred): Gas formula (lives in ABI spec), full Effects Ontology (the effects_id this tuple references), and crypto policy (which suites must be present). This slice binds to DSR and Tape but does not change their schemas.
+Depends on:
+• Tape v1.0 (Slice 1) → supplies tape_id.
+• RNG Domains v1.0 (Slice 2) → constrains how tape RNG appears.
+• Domain-Separation Registry v1.0 (Slice 3) → supplies tag immu.parity.tuple.v1.
+• Canonical serialization (encoder_id) from your Foundation layer.
+Stability note: This slice does not change program semantics, determinism, effect containment, or any acceptance criteria elsewhere. It only standardizes the commitment hash that both executors must match.
+1) Purpose (one paragraph)
+Parity is the single-line verdict of an execution: a content-addressed digest that binds the state you started from, the program you ran, the rules under which you ran it, the inputs you consumed, and the observable effects/costs you produced. If two different executors (interpreter vs staged) compute the same parity, they are observationally equivalent for that run.
+2) Top-level object
+The parity object is a CAS JSON:
+{ "schema": "parity.tuple.v1.1", "encoder_id": "…", "ds_registry_id": "…", "suite": "blake3", // hashing suite used for parity_id (policy may require more) "parity_id": "…", // §6 hashing "fields": { "pre_root": "sha256:…", // §3.1 "post_root": "sha256:…", // §3.1 "program_hash": "sha256:…", // §3.2 "abi_id": "…", // §3.3 "policy_id": "…", // §3.4 "encoder_id": "…", // §3.5 (repeated for binding) "effects_id": "…", // §3.6 "write_set_digest": "…", // §4 "gas_total": "…", // §3.7 "tape_id": "…", // §3.8 "energy_profile_id": "…", // §3.9 (semantics-inert, bound) "storage_profile_id": "…", // §3.10 (semantics-inert, bound) "tick_fold": { // optional, when per-tick parity is emitted "tick_hash": "…", // §5 "ticks": 1024 } } } 
+The same structure must be produced by the interpreter and any staged executor. No executor identifier may appear—parity must be executor-agnostic.
+3) Field definitions (normative)
+3.1 pre_root, post_root
+• 32-byte digests (suite as per storage plane; typically SHA-256) of the Merkle-DAG before and after the run.
+• Canonical form: lowercase hex, prefixed by algorithm (e.g., "sha256:<64-hex>").
+• Must correspond to real DAG roots reachable in CAS (Merkle closure verified elsewhere).
+3.2 program_hash
+• Content hash of the exact program bits executed (interpreter bytecode, staged blob, or VM program).
+• For staged artifacts, it is the staged artifact hash; for interpreter, the program bytecode/script.
+• Same run ⇒ same program_hash, regardless of executor.
+3.3 abi_id
+• Identifier of the sealed ABI version (opcodes/layout/cost model). If ABI changes, parity will change.
+3.4 policy_id
+• Identifier of the active OML policy snapshot used to make admission checks during the run.
+3.5 encoder_id
+• The canonical encoder version controlling all JSON/binary canonicalization. Bound here to prevent “encoder drift.”
+3.6 effects_id
+• Content hash of the effect table (DFA: addr_class × op_kind → max_len) the program declares. This ID ties parity to the effect containment contract.
+3.7 gas_total
+• Decimal string of a non-negative integer (no leading zeros except "0").
+• Value computed by the ABI cost model for the actual run (deterministic, sealed by abi_id).
+• Interpreter and staged must compute the same number.
+3.8 tape_id
+• Content hash of the tape manifest used (Slice 1). Binds parity to the exact exogenous inputs consumed.
+3.9 energy_profile_id (semantics-inert)
+• ID of the normative energy model/profile in effect (Instrumentation Plane). Included to prevent silent model/profile drift. Does not alter semantics.
+3.10 storage_profile_id (semantics-inert)
+• ID of the storage layout/compression profile (e.g., packfile/CDC parameters). Included for completeness; does not alter semantics.
+4) write_set_digest (normative definition)
+Purpose: Bind parity to the set of logical writes performed by the program, independent of content, enabling precise effect checks and minimal counterexamples.
+4.1 Collect
+• Build the coalesced write set W = {(addr_i, len_i)} by taking the union of all writes in the run, coalescing overlapping or adjacent intervals.
+• Units: bytes. Addresses are unsigned 64-bit integers; len ≥ 1.
+• Exclude zero-length writes and no-ops; include zeroing writes as intervals.
+4.2 Canonical order
+• Sort W by (addr ASC, len ASC).
+4.3 Leaf encoding
+Each interval becomes a canonical JSON leaf:
+{"a":"0x0000000000001000","l":4096} 
+• a: address as fixed 16-hex lowercase string with 0x prefix.
+• l: length as decimal integer (string or number per your encoder_id; recommended as number).
+4.4 Digest computation
+• Build an array L = [leaf_0, leaf_1, …, leaf_n-1] (canonical JSON).
+• Compute: write_set_digest = H_S( P_ws || canonical(L) ) where P_ws is the DSR prelude for immu.parity.write_set.v1 (see §7.2).
+Edge cases:
+• If W is empty, L = []; digest is H_S(P_ws || "[]"). (Never omit the field.)
+5) Optional per-tick parity and run fold
+When engines (e.g., Godot) emit per-tick parity, we standardize it to allow segmented verification.
+5.1 Per-tick parity object
+For tick t, define bytes:
+tick_bytes = canonical({ "t": t, "pre": pre_tick_root, "in": input_event_hash_t, "effects_id": effects_id, "wsd": write_set_digest_t, "gas": gas_tick, "post": post_tick_root }) 
+• Hash as tick_parity_t = H_S( P_tick || tick_bytes ) with DSR tag immu.parity.tick.v1.
+5.2 Run fold
+Define tick_hash = H_S( P_tickfold || concat(tick_parity_0 … tick_parity_{N-1}) ) with DSR tag immu.parity.tickfold.v1.
+If tick_fold is present in the top-level tuple, tick_hash must be consistent with the same writes/gas aggregated into the run-level fields.
+Presence of per-tick parity is optional; if present, both executors must match it too.
+6) Hashing & IDs (DSR-bound)
+• Tag for run parity: immu.parity.tuple.v1 (DSR).
+• Prelude: per DSR V1; P_par = ULEB128(len(tag)) || tag || 0x00.
+• Bytes: canonical({fields}) exactly as in §2 (key order by canonical encoder).
+• parity_id = H_S( P_par || canonical({fields}) ).
+Write-set & tick tags (added by this slice):
+• immu.parity.write_set.v1 — write set digest prelude.
+• immu.parity.tick.v1 — per-tick parity prelude.
+• immu.parity.tickfold.v1 — per-run fold-of-ticks prelude.
+DSR delta: These three tags are append-only additions to the DSR (Slice 3). Publishing this slice implies producing an updated ds_registry.json with the new entries and a new ds_registry_id. Prior objects continue to cite their older DSR; parity tuples v1.1 must cite the updated one.
+7) Canonical encoding rules (recap)
+• Key order: lexicographic by key bytes under encoder_id.
+• Numbers: integers as minimal decimals (0, 1, …), no leading +/0; floats (if any in tick bytes) as IEEE-754 decimal strings per encoder rules; avoid NaN/Inf.
+• Strings: lowercase ASCII for IDs; hex always lowercase.
+• No extraneous fields. Any unknown field invalidates the object.
+8) Verifier rules (acceptance)
+Given a claimed parity.tuple.v1.1 object:
+• Schema/encoder check: schema and encoder_id are supported.
+• DSR check: Load DSR by ds_registry_id; confirm tags in §6 exist.
+• Field presence: All fields in §2 must be present; tick_fold is optional but, if present, must contain both tick_hash and ticks.
+• Type/format: Enforce formats in §3 and §4 (hex lengths, decimal strings).
+• Hash closure: Recompute parity_id; compare to claimed value.
+• Cross-object consistency:
+• pre_root must equal the state root in the transaction precondition.
+• post_root must equal the state root after applying the program under tape.
+• program_hash must match the content-addressed program object referenced in the proof bundle.
+• tape_id must equal the tape manifest consumed.
+• effects_id must match the effect table the program declared.
+• write_set_digest must equal the digest computed from the coalesced writes in the op log.
+• gas_total must equal the ABI cost model result for the run.
+• If tick_fold present: recompute from per-tick records and require exact match.
+• Executor-agnostic equality: Verify bitwise equality of the tuple produced by both executors (interpreter, staged) for the same run. If they differ, execution must be blocked (policy outside this slice), and a parity-break witness produced.
+9) Deterministic errors (reason names)
+• PAR_E_SCHEMA — schema unsupported.
+• PAR_E_ENCODER — encoder_id unsupported or mismatched canonicalization.
+• PAR_E_DSR — ds_registry_id invalid or missing required tags.
+• PAR_E_FIELD_MISSING — any required field absent.
+• PAR_E_FMT — field present but badly formatted (hex width, decimal rules).
+• PAR_E_HASH_MISMATCH — recomputed parity_id differs.
+• PAR_E_PRE_ROOT / PAR_E_POST_ROOT — roots don’t match state before/after replay.
+• PAR_E_PROGRAM_HASH — referenced program blob hash mismatch.
+• PAR_E_TAPE_ID — tape mismatch.
+• PAR_E_EFFECTS_ID — effect table id mismatch.
+• PAR_E_WSD — write set digest mismatch with op log coalesced set.
+• PAR_E_GAS — gas total mismatch with ABI formula.
+• PAR_E_TICKFOLD — per-tick fold mismatch or inconsistent ticks.
+Each failure must include a minimal counterexample witness: first differing byte offset or first inconsistent event/op, plus the expected vs actual digest.
+10) Edge cases & corner rules
+• Empty write set: Allowed; write_set_digest is the hash of empty array under the write-set tag.
+• Zero-op programs: Allowed if permitted by ABI; parity still binds pre/post roots (likely equal) and gas_total (often 0).
+• Multiple suites: Policy may require both blake3 and sha256; emit two parity objects (or a multihash field) with identical bytes except suite/parity_id.
+• Upgrades mid-run: Not allowed; parity binds a single abi_id. Upgrades produce separate runs/tuples.
+• Executor metadata: Executor kind/version must not appear in parity; capture it in the proof bundle as evidence only.
+11) Golden vectors (minimum set)
+Provide under golden/parity/v1.1/:
+• WSD-empty: A run with no writes, gas_total=0, identical pre/post roots. Expected write_set_digest (empty) and parity_id.
+• Single interval: One write [0x1000, len=4096]; show coalescing result and digest.
+• Overlap coalesce: Writes [0x1000..0x1800) and [0x1400..0x1C00) coalesce to [0x1000..0x1C00); expected digest.
+• Per-tick parity: 3 ticks with tick parities and tick_fold hash; run tuple must reflect aggregated WSD and gas.
+• Cross-executor equality: Same inputs run via interpreter and staged; both produce identical parity_id. Store both tuples and a diff (empty).
+Each vector file records: canonical bytes hex, DSR preludes, and expected digests under the permitted suite(s).
+12) What this does not change (stability)
+• Does not change any semantics of programs, tapes, capabilities, OML, or upgrades.
+• Does not dictate gas formulas; only binds the result.
+• Does not introduce executor identity into commitments.
+• Does not force per-tick parity; it standardizes it when present.
+End of Slice 4.
+Say continue to proceed. Recommended next slices that dovetail: Input Map v1.0 (deterministic scancode→code mapping for key.* events) or Effects Ontology v1.0 (addr_class/op_kind vocabulary that produces effects_id).
+Slice 5 — Input Map v1.0 (Deterministic Device→Logical Key Mapping)
+(Fully expanded, single sealed module. Builds on Slices 1–4. You hold the gate.)
+0) Scope & Dependencies
+In-scope: A normative, hash-pinned Input Map object that converts device-native input identifiers (e.g., Android KeyEvent codes, Linux evdev scancodes, Windows VK/scan-set) into canonical logical key codes used by Tape v1.0 key.down / key.up events. Includes: object schema, naming grammar, canonical code set, layout handling, repeat policy, IME/text rules, device-fingerprint hints, verifier checks, errors, and golden vectors.
+Out-of-scope (deferred):
+• Pointer/touch coordinate normalization details (already covered in Tape; optional follow-up slice if needed).
+• Gamepad/axis canonicalization beyond naming (a separate Gamepad Map v1.0 slice can mirror this pattern).
+• Full keyboard-layout database management (we define IDs and validation rules here; a separate Layout Pack slice can ship full tables when needed).
+Depends on:
+• Tape v1.0 (Slice 1): key.* and text.input event shapes.
+• DSR v1.0 (Slice 3): adds tag immu.input.map.v1.
+• Parity v1.1 (Slice 4): unchanged, but input maps are cited as evidence.
+• Canonical serialization (encoder_id): stable JSON encoding.
+Stability note: This slice does not change Tape v1.0 schema or parity. It specifies how recorders produce key.* payloads and how verifiers can audit that mapping when an input_map_id is provided alongside a tape (as evidence in manifest.created_by). Replays remain independent of any input map.
+1) Purpose (one paragraph)
+The Input Map makes recording deterministic and auditable: given a device-native input (scan/VK/KeyEvent) and an optional layout_id, it yields a canonical logical code like "key_a", "enter", "shift_left". The tape stores only the logical code (plus the original scan as evidence), so all hosts replay identically. The map itself is content-addressed and hash-pinned so auditors can re-run the mapping and confirm that each event’s code and scan are consistent with the declared device/layout.
+2) Top-level object
+A CAS JSON:
+{ "schema": "input.map.v1.0", "encoder_id": "…", "ds_registry_id": "…", "input_map_id": "…", // §8 hashing "platform": "android|linux|windows|darwin|web", "source_api": "android.keyevent|linux.evdev|win32.vk|hid.usage|web.uievents", "layout_id": "kbd.us-qwerty|kbd.xx-…", // optional, see §4 "device_fingerprint": { "vendor": "0x045e", // optional USB/HID ids or build strings "product": "0x07f8", "name": "Microsoft Wired 600", "os_build": "android-14|linux-6.8|win-10.0.19045" }, "repeat_policy": { // §6 "generate_repeat": true, "repeat_ord_mode": "compress|explicit" }, "codeset": { // normative canonical code set (§3) "version": "kbd.code.v1", "codes": [ "key_a", "key_b", "digit_0", "enter", "space", "shift_left", "shift_right", … ] }, "table": [ // mapping rows (§5) { "native": {"code": 29, "set": "android"}, // example: Android KEYCODE_A "logical": "key_a", "location": "standard|left|right|numpad", "mods_lock": {"caps": true, "num": false, "scroll": false} }, { "native": {"code": 66, "set": "android"}, "logical": "enter", "location": "standard", "mods_lock": {"caps": false, "num": false, "scroll": false} } // … many rows ], "dead_keys": [ // optional (§4.4) {"logical": "dead_acute"}, {"logical": "dead_grave"}, {"logical": "dead_circumflex"} ], "notes": "Human-readable provenance and layout hints", "signatures": [ /* optional operator/judge signatures over input_map_id */ ] } 
+3) Canonical logical code set (codeset)
+We define a finite, executor-agnostic set of canonical key codes. These are lowercase, snake_case strings. The set is append-only within kbd.code.v1. Representative (not exhaustive in prose; full list is in the object’s codes array and golden vectors):
+3.1 Alphanumeric & symbols
+• Letters: key_a … key_z
+• Digits (top row): digit_0 … digit_9
+• Symbol cluster: minus, equal, bracket_left, bracket_right, semicolon, quote, backquote, backslash, comma, period, slash, intl_backslash, intl_yen, intl_ro
+3.2 Function & navigation
+• escape, tab, caps_lock, space, enter, backspace
+• insert, delete, home, end, page_up, page_down
+• Arrows: arrow_up, arrow_down, arrow_left, arrow_right
+• print_screen, scroll_lock, pause
+• context_menu
+• f1 … f24
+3.3 Modifiers & system
+• shift_left, shift_right, ctrl_left, ctrl_right, alt_left, alt_right, meta_left, meta_right
+• Locks: num_lock, caps_lock, scroll_lock (also listed in 3.2 for clarity)
+3.4 Numpad cluster
+• numpad_0 … numpad_9, numpad_add, numpad_subtract, numpad_multiply, numpad_divide, numpad_decimal, numpad_enter, numpad_equal, numpad_comma, numpad_paren_left, numpad_paren_right
+3.5 Dead keys (when layout requires)
+• dead_acute, dead_grave, dead_circumflex, dead_tilde, dead_diaeresis, dead_caron, dead_breve, dead_macron, dead_dot_above, dead_double_acute, dead_ogonek, dead_cedilla, dead_ring_above
+The full authoritative list appears inside codeset.codes. This JSON is canonical and hash-pinned; verifiers must use it rather than any external table.
+4) Layouts, IME, and text
+4.1 layout_id
+• Grammar: kbd.<iso-3166-1-alpha2>-<layout_name>, e.g., kbd.us-qwerty, kbd.de-qwertz, kbd.jp-106.
+• layout_id is evidence about how the recorder interpreted native keys. Replayers don’t need it because the tape already carries the logical code.
+4.2 Keys vs characters
+• key.* events are physical keys (code), not characters.
+• text.input events carry characters after IME/layout composition. They are separate events (Tape v1.0). A single key press may produce both a key.down/key.up and a later text.input.
+4.3 IME policy
+• If an IME converts key sequences into text, the recorder must: 
+• Emit all physical key.* events with logical codes from the Input Map.
+• Emit text.input events only when the IME produces committed text.
+• No duplicate text for the same commit; composition updates are not recorded as text (implementation detail outside this slice).
+4.4 Dead keys
+• Dead keys (if present in the layout) are represented as their own key.* events with logical in the dead_* family. Composition into characters appears later as text.input. This separation keeps tape deterministic across IMEs.
+5) Mapping table semantics (table[])
+Each table row defines one mapping:
+{ "native": { "code": <int or string>, "set":"android|evdev|win.vk|hid" }, "logical": "<one of codeset.codes>", "location": "standard|left|right|numpad", "mods_lock": {"caps": <bool>, "num": <bool>, "scroll": <bool>} } 
+• native.code:
+• Android: integer KEYCODE_* value (e.g., A=29, ENTER=66).
+• Linux evdev: integer KEY_* code (e.g., A=30, ENTER=28).
+• Windows VK: integer VK_* (e.g., A=0x41, RETURN=0x0D); if using scancodes, specify set:"win.scan1" and provide the set-1 scancode integer.
+• HID usage: 16-bit usage id (page+id encoded as string page:id or a single integer if pre-agreed).
+• logical: canonical code (as in §3).
+• location: disambiguates left/right/numpad when the native codes collapse them.
+• mods_lock: static lock behavior hints for verifiers (e.g., num_lock affects numpad_* numeric vs arrow semantics); these do not change the logical code.
+Determinism rule: For a given (native.code, set, optional location), mapping to logical must be single-valued within one input_map_id. If a device uses the same native code for multiple physical keys, produce distinct rows using location or device-specific Input Maps.
+6) Repeat policy (repeat_policy)
+• generate_repeat: if true, the recorder emits additional key.down events for held keys with "repeat": true inside payload. If false, recorder emits only the first key.down, and repeat behavior is represented only by repeated text.input (if any) or by game logic reading sustained key state (outside this slice).
+• repeat_ord_mode: 
+• compress: repeats for the same tick/ord are coalesced (not recommended if you need precise repeat cadence).
+• explicit: each repeat causes a new key.down event with incrementing ord. Recommended for precision.
+Tape verifiers do not enforce a repeat cadence; they only check that the event sequence obeys Tape ordering rules (§7 in Slice 1).
+7) Using an Input Map during recording vs verification
+• Recording: The device-side recorder uses the Input Map (input_map_id) to translate native events into tape key.* codes. It should also populate payload.scan (native code) and mods states.
+• Verification: A verifier, given the same Input Map, may re-map each event’s scan back to logical and assert equality with the event’s code. If they mismatch, the tape is flagged (INMAP_E_MISMATCH), but replay still uses the tape’s code.
+Reference location: The tape manifest may include (evidence-only) created_by.input_map_id so auditors can fetch it. This does not alter Tape v1.0 schema; it uses the created_by free-form area defined in Slice 1 §3.1.
+8) Hashing & IDs (DSR-bound)
+• Tag: immu.input.map.v1 (append to DSR).
+• Prelude: per DSR V1.
+• Bytes: canonical JSON of the Input Map object.
+• input_map_id = H_S( P_inmap || canonical(input_map) ).
+9) Deterministic errors (reason names)
+• INMAP_E_SCHEMA — unsupported schema.
+• INMAP_E_ENCODER — encoder mismatch (non-canonical).
+• INMAP_E_DSR — ds_registry_id invalid or missing tag.
+• INMAP_E_CODESET — codeset.version unknown or codes contains duplicates/unknown grammar.
+• INMAP_E_TABLE_DUP — duplicate rows for the same (native.code,set,location) mapping to different logical codes.
+• INMAP_E_TABLE_UNKNOWN_CODE — a logical not present in codeset.codes.
+• INMAP_E_NATIVE_RANGE — native.code out of allowed range for set.
+• INMAP_E_LAYOUT_GRAMMAR — layout_id not matching grammar.
+• INMAP_E_MISMATCH — when verifying a tape: event scan + map ⇒ logical' ≠ event payload.code.
+• INMAP_E_LOCATION_REQUIRED — mapping ambiguous without location for a key family that needs it (e.g., left vs right shift).
+• INMAP_E_SIGN — signature invalid (if signatures used).
+Each error must carry a minimal witness: offending row or event index, native code/set, expected vs actual logical code.
+10) Golden vectors (minimum set)
+Store under golden/input-map/v1.0/:
+• Android US sample: A small Android map (platform:"android", source_api:"android.keyevent", layout_id:"kbd.us-qwerty") with rows for A, Enter, Left/Right Shift, Numpad Enter; verify hashing to input_map_id.
+• Linux evdev JP-106: Demonstrates intl_yen and intl_ro; includes dead keys list; verify location handling.
+• Windows VK left/right ctrl: Confirms that left/right are distinguished via location.
+• Roundtrip check file: Pairs of {native,set,location} -> logical and the inverse check over a sample tape with scan present—verifier expects no INMAP_E_MISMATCH.
+• Ambiguity vector: Two rows that would map the same (native,set) to different logical codes without location—verifier must raise INMAP_E_LOCATION_REQUIRED.
+Each vector file includes canonical bytes hex, DSR prelude hex, and expected digest(s).
+11) Interaction with other planes
+• Tape v1.0:
+• payload.code in key.* must be one of codeset.codes.
+• payload.scan is recommended (evidence) but not required.
+• mods snapshot is recorder-provided; semantic use is program-defined.
+• Parity / Effects:
+• Unchanged. Input Map presence does not affect parity_id or effects_id.
+• EP & Evidence:
+• Place the Input Map object under EP/config/input_map/… and reference its input_map_id in the tape manifest created_by.
+• For courts/tournaments, sign the Input Map with an operator key and include signatures.
+12) Edge cases & corner rules
+• Unknown keys: If a native code is unknown at record time, recorder may emit logical:"unknown" only if codeset.codes contains it (optional). Otherwise, the recorder must drop the event and record a diagnostic in evidence. Tapes containing unknown are replayable but should be flagged for design review.
+• Caps/Num/Scroll behavior: Lock states do not change logical codes; they affect text via IME only.
+• Multi-device rigs: If multiple keyboards emit different native sets, either use one Input Map that covers both (with distinct set/location rows) or declare separate maps and a merge manifest as evidence (future Input Map Set slice).
+• Virtual keyboards: Treat as platform:web|android with their own source_api and native codes; still map to codeset.codes.
+• Locale drift: If a user changes OS layout mid-session, the recorder must either (a) stick to the declared layout_id for the whole tape, or (b) segment the tape and emit a new manifest with a new input_map_id (preferred).
+13) Acceptance checks (verifier POV)
+Accept an Input Map iff:
+• Schema/encoder/DSR are supported and input_map_id recomputes.
+• codeset.version == "kbd.code.v1" and codes are unique and grammar-valid (^[a-z0-9_]+$).
+• Every table row maps to a logical present in codes.
+• No conflicting duplicates: same (native.code,set,location) → two different logicals.
+• Where hardware requires disambiguation (e.g., left/right), rows specify location or a device-specific explanation exists in notes.
+• If used to audit a tape, all events with scan either match or trigger deterministic INMAP_E_MISMATCH with a minimal witness.
+14) What this does not change (stability)
+• Does not modify the Tape schema or parity tuple.
+• Does not force inclusion of input_map_id in tapes; it recommends placing it in manifest.created_by as evidence.
+• Does not introduce platform-dependent semantics into replay; the tape’s code is authoritative.
+End of Slice 5.
+Say continue to proceed. Natural next slices that dovetail:
+• Gamepad Map v1.0 (canonicalize gamepad.button/gamepad.axis names & locations), or
+• Effects Ontology v1.0 (the vocabulary that yields effects_id used in parity).
+
+
+Slice 6 — Effects Ontology v1.0
+(Fully expanded, single sealed module. Builds on Slices 1–5. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• A normative vocabulary for address classes (addr_class) and memory op kinds (op_kind).
+• The Effect Table a program declares (effects_id) and how verifiers compute effect containment against the actual write set from a run.
+• The Class Map that labels the byte-address space with addr_class intervals at run time.
+• Hashing/IDs (DSR-bound), canonical encodings, validation rules, deterministic errors, and golden vectors.
+Out-of-scope (deferred):
+• High-level policy atoms (OML) and how policies “admit” effects (need ≤ ctx)—we reference policy_id but don’t redefine OML here.
+• Capability lineage proofs (their own slice) except where they feed the Class Map.
+• Gas formula details (ABI).
+• Non-memory “effects” (network send, logs, etc.). This slice constrains logical memory writes only.
+Depends on:
+• Tape v1.0 (Slice 1) — supplies inputs.
+• RNG Domains v1.0 (Slice 2) — orthogonal.
+• DSR v1.0 (Slice 3) — tags for objects introduced here.
+• Parity v1.1 (Slice 4) — uses effects_id and write_set_digest.
+• Capabilities (from your Capability Plane) — feeds Class Map intervals.
+Stability note: This slice does not change program semantics, parity composition, or canonical encoders. It only standardizes the vocabulary & checks that make “effect containment” precise and machine-verifiable.
+1) Purpose (one paragraph)
+“Effect containment” means: for any run, the coalesced write set must be a subset of a program-declared, hash-pinned Effect Table, and every write must fall wholly within address intervals labeled with a compatible Class Map entry. This gives us a static contract the verifier can prove from evidence, independent of code paths, while keeping parity/roots identical across hosts.
+2) Normative objects introduced
+We define three CAS objects:
+• Effects Ontology (effects.ontology.json) — global vocabulary for addr_class and op_kind with constraints and grammar.
+• Effect Table (effects.table.json) — per-program declaration that yields effects_id used in parity.
+• Class Map (effects.classmap.json) — per-run labeling of address ranges with addr_class (derived from capability grants).
+Each is canonical JSON, DSR-tagged, and content-addressed.
+3) Effects Ontology (global vocabulary)
+File: effects.ontology.json
+{ "schema": "effects.ontology.v1.0", "encoder_id": "…", "ds_registry_id": "…", "effects_ontology_id": "…", // §8 hashing "addr_class": [ {"name":"mem.app", "notes":"Application persistent state"}, {"name":"mem.temp", "notes":"Ephemeral scratch; may be pruned"}, {"name":"mem.cache", "notes":"Deterministic cache; rebuildable"}, {"name":"mem.assets", "notes":"Imported content; write-protected by policy in many modes"}, {"name":"mem.indices", "notes":"Indexes/TOCs for state; derived from app state"}, {"name":"mem.evidence", "notes":"Proof/evidence artifacts; semantics-inert"}, {"name":"mem.txlog", "notes":"Transaction op log (if materialized)"} ], "op_kind": [ {"name":"mem.write", "notes":"Arbitrary bytes written by program semantics"}, {"name":"mem.zero", "notes":"Zero-fill over intervals"}, {"name":"mem.copy", "notes":"Copy from one interval to another (logical write at dest)"} ], "naming": { "addr_class_re": "^[a-z][a-z0-9_]*(?:\\.[a-z0-9_]+)*$", "op_kind_re": "^[a-z][a-z0-9_]*(?:\\.[a-z0-9_]+)*$" }, "constraints": { "addr_classes_append_only": true, "op_kinds_append_only": true, "overlap_policy": "class_map_intervals_must_not_overlap" } } 
+Rules
+• Names are stable; removing or renaming items creates a new ontology version (effects.ontology.v1.1, etc.).
+• You may append new addr_class and op_kind entries in a new ontology version; older EPs continue to cite their original effects_ontology_id.
+• Overlap policy is fixed: per run, Class Map intervals must not overlap (see §6).
+The initial set above fits your stack. You can extend later without breaking runs bound to this version.
+4) Effect Table (per-program declaration)
+File: effects.table.json
+{ "schema": "effects.table.v1.0", "encoder_id": "…", "ds_registry_id": "…", "effects_ontology_id": "…", // must reference a known ontology "program_hash": "sha256:…", // optional but recommended: binds to bits "policy_id": "…", // policy snapshot assumed when this table was authored (evidence) "table": [ {"op":"mem.write","class":"mem.app", "max_total_len": 1048576}, {"op":"mem.zero", "class":"mem.app", "max_total_len": 524288}, {"op":"mem.write","class":"mem.indices", "max_total_len": 2097152}, {"op":"mem.write","class":"mem.temp", "max_total_len": 16777216}, {"op":"mem.write","class":"mem.cache", "max_total_len": 33554432} ], "extras": { "per_tick_caps": [], // optional future extension "per_class_write_cap": false // if true, forbids multiple writes crossing classes }, "effects_id": "…" // §8 hashing } 
+Semantics
+• The table is a set of (op_kind, addr_class → max_total_len) entries. max_total_len is the byte budget over the whole run for writes of that op into that class.
+• Any (op, class) not listed is forbidden (budget implicitly 0).
+• max_total_len is non-negative integer (0 allowed → effectively forbidden).
+• This table is program-declared (manifested for staged/interpreter builds) and gets referenced from parity via effects_id.
+Canonical order
+• Sort entries by (op ASC, class ASC) before hashing.
+5) What counts as a “write”
+This slice constrains logical writes that modify the app-visible address space:
+• mem.write: arbitrary byte writes.
+• mem.zero: zero-fill (treated as write of length).
+• mem.copy: destination interval’s length counts against max_total_len for (mem.copy, dest_class). The source read is not a write.
+Heals/maintenance (evidence-only storage rewrites, pack/indices rebuilds) are not app-space writes and must not appear in the run’s write set. Their certs (Slice 20) prove equality of pre/post root and unreachable-only touches.
+6) Class Map (per-run labeling of address space)
+File: effects.classmap.json
+{ "schema": "effects.classmap.v1.0", "encoder_id": "…", "ds_registry_id": "…", "effects_ontology_id": "…", "source": { "cap_lineage_ids": ["…","…"], // capability proofs used to derive this map "notes": "Generated from capability grants at run start" }, "intervals": [ {"a":"0x0000000000100000","l":65536,"class":"mem.app"}, {"a":"0x0000000000200000","l":32768,"class":"mem.indices"}, {"a":"0x0000000000300000","l":131072,"class":"mem.cache"} ], "overlap_checked": true, "classmap_id": "…" // §8 hashing } 
+Rules
+• Intervals must not overlap and must have l ≥ 1.
+• Coverage may be sparse; addresses not in intervals[] are unclassified → writes forbidden there.
+• class must exist in the cited ontology.
+• The Class Map is derived from capability grants (regions) and their associated class annotation at grant time (Capability Plane slice will define how class is attached to a region).
+Canonical order
+• Sort by a (ascending), then by l (ascending).
+7) Containment check (verifier procedure)
+Given:
+• Effect Table (effects_id),
+• Class Map (classmap_id), and
+• The run’s coalesced write set W = {(addr, len)}, and per-op logs to classify mem.write vs mem.zero vs mem.copy,
+the verifier performs:
+7.1 Interval classification
+For each write (addr,len,op_kind):
+• Locate the unique Class Map interval I = (A,L,class) such that [addr, addr+len) ⊆ [A, A+L).
+• If no interval exists or the write crosses a class boundary, reject (EFF_E_CLASS_MISS or EFF_E_CROSS_CLASS).
+• Accumulate len into counter C[op_kind, class] += len.
+7.2 Budget checks
+For each (op, class) in C:
+• Look up max_total_len in the Effect Table.
+• If not present or C[op,class] > max_total_len, reject (EFF_E_FORBIDDEN or EFF_E_BUDGET).
+7.3 Write-set digest agreement
+• Recompute write_set_digest from W (Slice 4 §4) and require equality with the parity tuple. If mismatch → reject (EFF_E_WSD_MISMATCH).
+Complexity: Classification is O(|W| log |intervals|) using binary search over non-overlapping intervals.
+8) Hashing & IDs (DSR-bound)
+New DSR tags (append-only):
+• immu.effects.ontology.v1 — for effects.ontology.json
+• immu.effects.table.v1 — for effects.table.json
+• immu.effects.classmap.v1 — for effects.classmap.json
+• (Optional auxiliary) immu.effects.signature.v1 — for compact “effect signature” summaries (see §11)
+ID derivations:
+• effects_ontology_id = H( P_ontology || canonical(ontology_json) )
+• effects_id = H( P_table || canonical(table_json) )
+• classmap_id = H( P_classmap || canonical(classmap_json) )
+Canonicalization requirements:
+• Sort arrays as specified (table entries and intervals).
+• Use fixed 16-hex addresses with 0x prefix; decimal minimal integers elsewhere.
+9) Deterministic errors (reason names)
+• EFF_E_SCHEMA — schema unsupported (any of the three objects).
+• EFF_E_ENCODER — encoder mismatch / non-canonical bytes.
+• EFF_E_DSR — required DSR tag not present or ds_registry_id mismatch.
+• EFF_E_ONTOLOGY_UNKNOWN — effects_ontology_id not recognized/loaded.
+• EFF_E_CLASS_UNKNOWN — class not in ontology.
+• EFF_E_OP_UNKNOWN — op not in ontology.
+• EFF_E_TABLE_DUP — duplicate (op,class) entries in Effect Table.
+• EFF_E_TABLE_ORDER — canonical order violated in Effect Table (should be sorted).
+• EFF_E_CLASSMAP_OVERLAP — intervals overlap or l=0.
+• EFF_E_CLASSMAP_ORDER — not sorted by address then length.
+• EFF_E_CLASS_MISS — a write falls outside any class interval.
+• EFF_E_CROSS_CLASS — a single write crosses class boundary.
+• EFF_E_FORBIDDEN — (op,class) not listed in Effect Table.
+• EFF_E_BUDGET — accumulated length exceeds max_total_len.
+• EFF_E_WSD_MISMATCH — recomputed write_set_digest differs from parity.
+• EFF_E_HASH — any object id mismatch after canonical hashing.
+Each failure must attach a minimal counterexample witness: the offending write (addr,len,op), the class interval context (or absence), and the (op,class) budget/absence.
+10) Edge cases & corner rules
+• Empty Effect Table: Means no writes are permitted; any write ⇒ EFF_E_FORBIDDEN.
+• Empty Class Map: Forbids all writes (since nothing is classified).
+• Large temp/cache budgets: Allowed; still must classify writes to their intervals.
+• Zero-length writes: Disallowed at source; if encountered in logs, ignore for counting, but their presence may indicate a separate program error (outside this slice).
+• mem.copy source/dest overlap: Only dest counts; classification uses dest interval.
+• Indices/evidence writes: If your architecture writes deterministically to mem.indices or mem.evidence during a run, include those classes in the Effect Table with budgets; otherwise such writes will be rejected.
+• Upgrades: A different effects_id between versions is expected. Old runs remain verifiable with their bound effects_id.
+11) Effect Signature (compact summary; optional)
+Some planes (Staging, Policy) need a compact “effect signature” for quick parity checks and policy admission. We standardize a deterministic summary object:
+File: effects.signature.json
+{ "schema": "effects.signature.v1.0", "encoder_id": "…", "ds_registry_id": "…", "effects_id": "…", "triples": [ ["mem.write","mem.app",1048576], ["mem.zero","mem.app",524288], ["mem.write","mem.indices",2097152], ["mem.write","mem.temp",16777216], ["mem.write","mem.cache",33554432] ], "signature_id": "…" // H( P_signature || canonical(triples) ) } 
+Rules
+• triples must be the Effect Table entries in the same canonical order.
+• Tag: immu.effects.signature.v1.
+• Used for policy→staging effect typing and quick diffing; the Effect Table remains the normative source for containment checks.
+12) Interaction with other planes
+• Capabilities: Capability grants must carry a class annotation (or be resolved via a deterministic mapping) so that the Class Map can be built from lineage proofs at run start. This slice assumes such an annotation exists and is evidenced.
+• Policy (OML): Policies can reason over sets of classes (e.g., “no mem.assets writes”). Admission checks (need ≤ ctx) are separate; this slice ensures that, once admitted, the actual writes stay within declared classes/budgets.
+• Parity: effects_id is bound into the parity tuple; write_set_digest must match recomputation.
+• Instrumentation: Budgets are semantics-only limits; PCV/scheduler decisions are independent (evidence-only).
+• Godot: Engine subsystems should funnel all logic writes into regions labeled with the correct class (e.g., save-state → mem.app, transient frame buffers → not app space).
+13) Golden vectors (minimum set)
+Store under golden/effects/v1.0/:
+• Ontology-A (baseline): The JSON shown in §3 → effects_ontology_id.
+• Table-A (no indices): A table allowing only (mem.write, mem.app: 1 MiB) and (mem.zero, mem.app: 512 KiB) → effects_id.
+• ClassMap-A: Three non-overlapping intervals for mem.app, mem.indices, mem.cache → classmap_id.
+• Containment-pass: Write set with {(0x100000, 4096, mem.write)} and {(0x100800, 2048, mem.zero)}, both inside mem.app and under budgets → accept.
+• Budget-fail: Same as 4 but total mem.write exceeds 1 MiB → EFF_E_BUDGET.
+• Class-miss: A write at 0x0000FF00 where no interval exists → EFF_E_CLASS_MISS.
+• Cross-class: A write [0x200000..0x201000) straddles mem.app and mem.indices → EFF_E_CROSS_CLASS.
+• Forbidden op: mem.copy to mem.indices when table has no (mem.copy, mem.indices) → EFF_E_FORBIDDEN.
+• WSD mismatch: Alter a single write length in the op log so recomputed WSD differs → EFF_E_WSD_MISMATCH.
+Each vector includes canonical bytes hex, DSR prelude hexes, and expected digests.
+14) Acceptance checks (verifier POV)
+Accept a run with respect to effects iff:
+• effects_ontology_id, effects_id, and classmap_id load, hash, and match their declared IDs with correct DSR tags.
+• Effect Table contains no duplicate keys and only ontology-listed names.
+• Class Map intervals are non-overlapping, sorted, with valid classes.
+• Every write classifies wholly within exactly one interval.
+• Accumulated (op,class) byte counts do not exceed max_total_len.
+• write_set_digest recomputes exactly.
+• (If signature present) effects.signature matches the table.
+Failure ⇒ deterministic error from §9 with a minimal witness.
+15) What this does not change (stability)
+• Does not alter the program’s semantics or ABI.
+• Does not change parity composition beyond referencing effects_id and write_set_digest (already defined).
+• Does not constrain evidence-only storage work (heals); those live outside app space and have their own certs.
+• Does not require full coverage of address space; unclassified addresses are simply write-forbidden.
+End of Slice 6.
+Say continue to proceed. Natural follow-ons that dovetail tightly:
+• Capability→Class annotation v1.0 (how capability grants produce the Class Map deterministically), or
+• OML Admission over Effects v1.0 (binding need ≤ ctx to classes/op kinds), or
+• Gamepad Map v1.0 (canonicalizing gamepad inputs similar to Slice 5).
+
+Slice 7 — Capability → Class Annotation v1.0
+(Fully expanded, single sealed module. Builds directly on Slices 1–6. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• The normative model for linear/affine capabilities over the byte-address space (grant/split/merge/revoke/consume).
+• How a capability carries a class annotation (from Effects Ontology v1.0) and permissions (R/W).
+• The canonical Capability Handle, Capability Event, and Lineage Proof objects.
+• The deterministic procedure that derives the Class Map at run start from live capabilities.
+• Verifier rules, deterministic errors, golden vectors, and DSR tags.
+Out-of-scope (deferred):
+• OML admission logic (policy side) and gas accounting details.
+• Network/file descriptor capabilities (this slice is memory-only).
+• Redaction/signature policy for operator identities (EP slice).
+Depends on:
+• Canonical serialization (encoder_id).
+• DSR v1.0 (Slice 3).
+• Effects Ontology v1.0 (Slice 6): we reference effects_ontology_id and classes.
+• Parity v1.1 (Slice 4): we do not change it, but our outputs are inputs to effect containment.
+• Tape v1.0 (Slice 1): independent; ops reference Cap Handles.
+Stability note: This slice does not change the program semantics, parity tuple, write-set digest definition, or effect containment rules already published. It specifies the capability objects and derivation that feed those checks.
+1) Purpose (one paragraph)
+Capabilities are the ground truth of what ranges may be written, and why. Each capability binds an address interval, a permission (R/W), and a class from the Effects Ontology. A linear lineage (grant→split/merge→consume/revoke) ensures no OOB writes and no double-use. At run start, we compute the Class Map by projecting the set of live write-capable intervals and their classes. Effect containment (§Slice 6) then checks that the actual writes are subset-of those intervals and within the declared Effect Table budgets.
+2) Normative objects (CAS, canonical JSON)
+We introduce four objects:
+• Capability Handle — the durable identifier for a capability interval.
+• Capability Event — grant/split/merge/revoke/consume operations.
+• Lineage Proof — the inclusion-checked set of events that establishes a handle’s legitimacy and liveness.
+• Capability Snapshot — the live set at a reference point (t_ref) used to derive the Class Map.
+All are DSR-tagged, content-addressed, and encoder-canonical.
+3) DSR tags (append-only)
+• immu.cap.handle.v1 — Capability Handle bytes.
+• immu.cap.event.v1 — Capability Event bytes.
+• immu.cap.proof.v1 — Lineage Proof bundle bytes.
+• immu.cap.snapshot.v1 — Capability Snapshot (live set at t_ref).
+(These must be added to the DSR; publishing this slice implies a new ds_registry_id that includes them.)
+4) Capability Handle (identity & content)
+File shape (conceptual; typically embedded in events):
+{ "schema": "cap.handle.v1.0", "encoder_id": "…", "ds_registry_id": "…", "handle_id": "…", // §4.2 hashing "addr": "0x0000000000001000", // 16-hex, aligned (§4.1) "len": 4096, // bytes ≥1; typical page-aligned "perm": "R|W|RW", // permission lattice "class": "mem.app", // from Effects Ontology "effects_ontology_id": "…", // binds class to a concrete ontology "owner": "app|kernel|tool|mod:<id>", // free-form namespace (lowercase) "nonce": "…", // 128-bit hex randomness to avoid collisions "parent": "…|null", // handle_id of parent if split/merge-derived "epoch": 1 // monotone run-local integer (see §8.1) } 
+4.1 Alignment & coverage
+• addr must be aligned to a declared granule (at least 64 or 4096 bytes). The ABI/engine decides the minimum; we recommend 4096.
+• len ≥ 1 and typically a multiple of the granule.
+• The interval is [addr, addr+len).
+4.2 Handle ID derivation (DSR-bound)
+handle_id = H( P_handle || canonical({ "addr","len","perm","class","effects_ontology_id","owner","nonce","parent","epoch" }) ) 
+• Changing any of these fields changes the handle identity.
+• The nonce prevents predictable collisions across owners/epochs.
+Invariant: A handle’s class is immutable through its descendants; splits/merges inherit the class from their sources (see §5).
+5) Capability Event (grant/split/merge/revoke/consume)
+File: cap.event.v1.0
+{ "schema": "cap.event.v1.0", "encoder_id": "…", "ds_registry_id": "…", "event_id": "…", // §5.4 hashing "kind": "grant|split|merge|revoke|consume", "pre_root": "sha256:…", // root BEFORE the event (Hoare-style) "post_root": "sha256:…", // root AFTER the event (for events that change state; may == pre_root for admin-only changes) "epoch": 1, // monotone, ties to handle "handles": { // operands/results depend on kind "new": ["…"], // produced handles (grant/split/merge) "use": ["…"], // handles consumed or referenced (split/merge/consume/revoke) "inputs": ["…"] // for merge: list of parents; for split: the single parent }, "oplog_ref": "…", // optional pointer into txn op log / cert "proofs": { // optional inclusion paths for pre/post roots "pre_inclusion": "…", "post_inclusion": "…" } } 
+5.1 grant
+• Inputs: none (or an administrative “authority” proof out of band).
+• Outputs: exactly one new handle with fields set.
+• Preconditions: 
+• Interval does not overlap with any other live W/R handle of different class (see §7.1).
+• If overlapping a live handle of the same class & owner, the system may either (a) reject grant or (b) treat it as intentional duplication pending merge. This slice recommends reject to keep live sets non-overlapping and non-duplicated.
+5.2 split
+• Inputs: exactly one parent (in inputs).
+• Outputs: N ≥ 2 new handles such that: 
+• Their intervals are disjoint and union to the parent interval.
+• perm_new ≤ perm_parent (W may be split into R/W or R only; cannot up-escalate).
+• class_new == class_parent.
+• Consume-on-use: The parent appears in use and becomes consumed (non-live); only the new handles are live afterwards.
+5.3 merge
+• Inputs: K ≥ 2 parents in inputs whose intervals are disjoint and adjacent or separable; class and perm are identical across all parents.
+• Outputs: exactly one new handle covering the union of parents.
+• All parents appear in use and become consumed.
+5.4 revoke
+• Inputs: 1..N handles in use.
+• Outputs: none.
+• Effect: All listed handles become consumed (non-live).
+5.5 consume
+• Inputs: 1 handle in use.
+• Outputs: none.
+• Effect: Marks the handle as consumed due to a program operation that requires single-use (rare for memory; included for completeness and symmetry).
+5.6 Event ID derivation
+event_id = H( P_event || canonical({kind, pre_root, post_root, epoch, handles})) 
+6) Lineage Proof (bundle establishing liveness & rights)
+File: cap.proof.v1.0
+{ "schema": "cap.proof.v1.0", "encoder_id": "…", "ds_registry_id": "…", "proof_id": "…", // §6.3 hashing "effects_ontology_id": "…", "t_ref": { "root": "sha256:…", "epoch": 1 }, // reference point (pre_root of run) "events": ["…", "…", "…"], // list of event_ids in topo order "handles_claimed": ["…","…"], // handle_ids whose liveness is asserted at t_ref "inclusions": { // optional: Merkle proofs that events are recorded in the EP / ledger "manifest_cas": "…", "paths": ["…"] } } 
+Semantics
+• The verifier reconstructs a state machine by replaying events in order, starting from no live handles.
+• A handle in handles_claimed is live @ t_ref iff: 
+• It was produced by a grant/split/merge event that precedes t_ref, and
+• It was not consumed by any later split/merge/revoke/consume event before t_ref.
+• The bundle must be closed: every handle id mentioned in events.inputs/use/new is present somewhere within the bundle (no dangling references).
+Invariants enforced during replay:
+• No overlap among live intervals (by address) at any step.
+• Class immutability across splits/merges.
+• Permission monotonicity (new.perm ≤ parents.perm).
+• Epoch monotonicity (non-decreasing across events; see §8.1).
+• Nonce uniqueness (no two distinct live handles share (addr,len,perm,class,owner,epoch) without different nonces; duplicate construction is allowed only if parents/outputs reconcile in the same event).
+6.3 Proof ID
+proof_id = H( P_proof || canonical({ "effects_ontology_id","t_ref","events","handles_claimed" }) ) 
+7) Capability Snapshot → Class Map derivation
+File: cap.snapshot.v1.0
+{ "schema": "cap.snapshot.v1.0", "encoder_id": "…", "ds_registry_id": "…", "proof_id": "…", // lineage proof used "t_ref": { "root": "sha256:…", "epoch": 1 }, "live": [ {"handle":"…","addr":"0x…","len":65536,"perm":"RW","class":"mem.app"}, {"handle":"…","addr":"0x…","len":32768,"perm":"RW","class":"mem.indices"} ], "snapshot_id": "…" // §7.3 hashing } 
+7.1 Live set definition
+• Live means: produced by a grant/split/merge before t_ref and not consumed/revoked before t_ref.
+• W-only projection: For Class Map, we consider only handles whose perm includes W (write). Read-only regions do not admit writes and therefore do not appear.
+7.2 Derive Class Map
+From live:
+• Group handles by class.
+• Within each class, merge adjacent intervals that are contiguous and have identical perm (RW), owner (optional), and epoch (optional).
+• Verify no overlaps remain.
+• Emit an effects.classmap.json (Slice 6) using the resulting intervals and the same effects_ontology_id.
+7.3 Snapshot ID
+snapshot_id = H( P_snapshot || canonical({ "proof_id","t_ref","live" }) ) 
+8) Determinism hooks
+8.1 Epoch discipline
+• epoch is a run-local monotone integer starting at 1.
+• All capability events used to build the run-time Class Map must have epoch ≤ run_epoch.
+• Multiple independent capability timelines (e.g., different projects) must not share epochs; otherwise, include a namespace in owner to avoid ambiguity.
+8.2 Alignment granule
+• The minimum alignment granule is specified by the ABI or engine build and must be included as evidence in the EP. Misaligned grants → reject (CAP_E_ALIGN).
+9) Verifier procedure (summary)
+Given a run with a claimed Class Map, a set of cap.proof.v1.0 bundles, and a cap.snapshot.v1.0:
+• Load & hash-check all capability objects against their DSR tags.
+• Reconstruct live set by replaying each cap.proof up to t_ref.root (must equal the run’s pre_root).
+• Union live sets from all proofs; reject if any overlap by address across classes (CAP_E_OVERLAP).
+• Project to W-only and derive Class Map (§7.2); recompute classmap_id and require equality with the one referenced by Effects checks (EFF_E_HASH on mismatch).
+• For each write op in the txn op log: 
+• If the op references a handle id, verify that handle was live, had W permission, and the write interval lies within its bounds (CAP_E_OOB or CAP_E_PERM).
+• Optionally verify no double-use if a handle is marked consume-on-use (not common for memory; see §10.5).
+• Hand off to Effect Containment (Slice 6) with the derived Class Map.
+10) Deterministic errors (reason names)
+• CAP_E_SCHEMA — unsupported schema for any cap object.
+• CAP_E_ENCODER — non-canonical encoding.
+• CAP_E_DSR — unknown/missing DSR tags.
+• CAP_E_ALIGN — addr or len violates alignment granule.
+• CAP_E_CLASS_UNKNOWN — class not present in the cited Effects Ontology.
+• CAP_E_PERM_UPSCALE — split/merge produced higher permission than inputs.
+• CAP_E_CLASS_MUTATE — split/merge changed class.
+• CAP_E_PARENT_MISSING — event references a parent not present in the same proof.
+• CAP_E_TOPO — event order invalid (using a consumed handle, or revoke before grant).
+• CAP_E_OVERLAP — live handles overlap by address at any point.
+• CAP_E_GAP_SPLIT — split outputs don’t union to the parent interval.
+• CAP_E_MERGE_DISJOINT — merge inputs overlap or have a hole or have differing class/perm.
+• CAP_E_LIVENESS — a handle claimed live has been consumed/revoked before t_ref.
+• CAP_E_OOB — a write lies outside its referenced handle interval.
+• CAP_E_PERM — a write uses a handle without write permission.
+• CAP_E_SNAPSHOT_HASH — recomputed snapshot_id or derived classmap_id mismatches.
+• CAP_E_EPOCH — event epoch greater than run epoch (temporal violation).
+Each failure returns a minimal witness: offending event id or handle id, the interval(s) involved, and expected vs actual invariants.
+11) Edge cases & corner rules
+• Read-only caps: They never project into the Class Map (which is write admission), but they may be referenced by read ops (outside this slice).
+• Duplicate grants (same interval/class): Discouraged; if present, must be immediately merged into a single handle before t_ref. Otherwise CAP_E_OVERLAP.
+• Holes inside a parent on split: Illegal; outputs must exactly partition the parent interval.
+• Cross-class overlap at different epochs: Still illegal at t_ref; liveness union must be overlap-free.
+• Consume-on-use for memory: Rare; if used (e.g., “single-write window”), the op log must decrement the handle’s remaining budget to zero, after which further use ⇒ CAP_E_TOPO.
+• Owner field: For evidence/audit only; verifiers do not authorize by owner.
+• post_root handling: Capability events may be administrative; pre_root==post_root is allowed. If a capability grant allocates zero-filled memory, the txn’s write set reflects the zeroing via mem.zero if it changed state; otherwise the grant is purely authority, not a write.
+12) Golden vectors (minimum set)
+Store under golden/capability/v1.0/:
+• Grant-A: One grant of [0x1000, 4096] class mem.app, perm RW; valid handle_id, event hash.
+• Split-A: Split Grant-A into two [0x1000,2048] and [0x1800,2048]; parent consumed; union equals parent.
+• Merge-A: Merge the two splits back; same class/perm; output matches original.
+• Revoke-A: Revoke the merged handle; liveness becomes empty.
+• Overlap-fail: Two grants overlapping with differing classes → CAP_E_OVERLAP.
+• ClassMap-derive: Grants for mem.app and mem.indices produce a W-only Class Map with two intervals; classmap_id matches Effects vector.
+• OOB-fail: Write [0x0FF0, 64] with referenced handle [0x1000, 4096] → CAP_E_OOB.
+• Perm-fail: Handle perm R, op attempts write → CAP_E_PERM.
+• Epoch-fail: Event epoch 3 when run epoch is 2 → CAP_E_EPOCH.
+Each vector contains canonical bytes hex, DSR prelude hex, and expected digests.
+13) Acceptance checks (verifier POV)
+A capability subsystem is accepted for a run iff:
+• All capability objects load and recompute their IDs with the declared DSR tags.
+• Lineage proofs replay to a unique, overlap-free live set at t_ref.
+• The derived Class Map matches the one referenced by Effects verification.
+• Every write op (optionally annotated with a handle) lies within a live, write-permitted interval at t_ref.
+• No error listed in §10 occurs.
+Failure ⇒ reject with the appropriate deterministic code and a minimal witness.
+14) What this does not change (stability)
+• No changes to Tape, Parity, Effects semantics, or the ABI cost model.
+• No executor-specific behavior; capability checks are purely structural and offline-verifiable.
+• No storage-layer or instrumentation behavior changes.
+End of Slice 7.
+Say continue to proceed. Natural next slices that dovetail:
+• OML Admission over Effects v1.0 (formalizing need ≤ ctx with concrete atoms bound to classes/op kinds), or
+• Gamepad Map v1.0 (canonicalization for gamepad.* events, mirroring Input Map), or
+• Crypto Policy & Multihash v1.0 (which suites must be present where, migration rules).
+
+Slice 8 — OML Admission over Effects v1.0
+(Fully expanded, single sealed module. Builds on Slices 1–7. You hold the gate.)
+0) Scope & Dependencies
+In-scope: A normative bridge from Effects (Slice 6) and Capabilities→Class (Slice 7) into the Policy Plane (OML) you defined earlier. It fixes:
+• How to derive a policy requirement (“need”) from the program’s Effect Table and, optionally, the Class Map.
+• How to encode and hash need, context selection, the admission check need ≤ ctx, and the compatibility witness.
+• The canonical Policy Snapshot, Need, and Admission Certificate objects (IDs, DSR tags, encodings, errors, vectors).
+Out-of-scope (deferred):
+• Constructing/authoring the OML lattice itself (atoms, Hasse diagram generation rules)—that’s your Policy Plane and its artifacts.
+• Numeric budgets (already checked by Effects Slice 6); admission is structural (what kinds of effects are allowed), not quantitative.
+• Dynamic context switching policies (we allow it; selection is evidenced here, not designed here).
+Depends on:
+• Effects Ontology v1.0 (Slice 6) → effects_ontology_id, effects_id.
+• Capability→Class Annotation v1.0 (Slice 7) → classmap_id (optional input here).
+• DSR v1.0 (Slice 3) → we add tags.
+• Parity v1.1 (Slice 4) → carries policy_id & can bind an effect signature; unchanged by this slice.
+• Canonical serialization (encoder_id) and the Policy Plane’s OML proof objects.
+Stability note: This slice does not change determinism, parity composition, effects containment, or capability lineage rules. It only standardizes the admission interface so independent verifiers agree when a run is permitted by policy.
+1) Purpose (one paragraph)
+Admission answers a single question before (and auditable after) a run: Does the selected policy context allow the kinds of writes this program may perform? We encode that as an OML inequality: need ≤ ctx. Here, need is a lattice element representing the effect kinds a program might exercise (from its declared Effect Table), and ctx is a Boolean block element chosen from the current Policy Snapshot. The certificate records the context, the compatibility witness, and the equality check via meet(ctx, need) == need.
+2) DSR tags (append-only)
+Add these to the DSR (Slice 3):
+• immu.policy.snapshot.v1 — Policy Snapshot (OML export used for admission).
+• immu.policy.need.v1 — Need object (effect→atom translation result).
+• immu.policy.admit.v1 — Admission Certificate (the check & witnesses).
+• immu.policy.effsig.v1 — (optional) flat effect signature used by policy (matches Slice 6 §11).
+Publishing this slice implies a new ds_registry_id that includes the above.
+3) Objects & IDs (canonical JSON, content-addressed)
+3.1 Policy Snapshot (policy.snapshot.json)
+A sealed export of the OML lattice sufficient for membership and context reasoning:
+{ "schema": "policy.snapshot.v1.0", "encoder_id": "…", "ds_registry_id": "…", "policy_id": "…", // this object’s content id (§7) "atoms": [ {"name":"eff.mem.write.mem.app","id":"…"}, {"name":"eff.mem.zero.mem.app","id":"…"}, {"name":"eff.mem.write.mem.indices","id":"…"}, {"name":"eff.mem.write.mem.cache","id":"…"} // … all atoms used by this policy revision ], "contexts": [ { "name":"ctx.default.strict", "context_id":"…", // hash of sorted atom ids forming the Boolean block "members":["…","…","…","…"] // atom ids in this context (Boolean block) }, { "name":"ctx.dev.permissive", "context_id":"…", "members":["…","…","…","…","…"] } ], "relations": { "covers":[["a","b"],["b","c"]], // optional: cover graph edges (ids) "orth":["…","…"] // optional: orthocomplements mapping or witnesses }, "proofs": { "orthomodular": "cas://…", // optional proof bundles (Policy Plane artifacts) "nondistributivity": "cas://…" } } 
+• policy_id = H( P_policy_snapshot || canonical(snapshot) ).
+Minimality: The snapshot can be a projection of your full OML lattice containing only the atoms and contexts used for admission in this EP revision.
+3.2 Need (policy.need.json)
+A lattice element built from the program’s Effect Table (Slice 6) by a pure translation into policy atoms.
+{ "schema": "policy.need.v1.0", "encoder_id": "…", "ds_registry_id": "…", "effects_id": "…", "effects_ontology_id": "…", "translation": { "rule": "op_class_atom_v1", // normative mapping rule id (§4) "atoms": [ // the **set** of atoms being met-conjoined "eff.mem.write.mem.app", "eff.mem.zero.mem.app", "eff.mem.write.mem.indices", "eff.mem.write.mem.cache" ] }, "need_repr": { "atom_ids": ["…","…","…","…"], // resolved atom ids from Policy Snapshot "normalized": "meet(a,b,c,d)" // human-readable summary (non-semantic) }, "need_id": "…" // §7 hashing } 
+• need_id = H( P_policy_need || canonical(translation + resolved atom ids) ).
+Note: Quantities (max_total_len) are not part of need; budgets are enforced by Effects verification. need is a type of effect, not its magnitude.
+3.3 Admission Certificate (policy.admit.json)
+Binds the selected context and proves need ≤ ctx.
+{ "schema": "policy.admit.v1.0", "encoder_id": "…", "ds_registry_id": "…", "policy_id": "…", // Policy Snapshot used "context": { "name": "ctx.default.strict", "context_id": "…" }, "need_id": "…", "compat_witness": { // witness that need & ctx live in same Boolean block "atom_names": ["…","…"], // minimal set witnessing compatibility (Policy Plane rule) "proof_ref": "cas://…" // optional: proof of compatibility }, "check": { "form":"need_le_ctx", "lhs":"need_id", "rhs":"context_id", "result":"pass|fail" }, "admit_id": "…" // §7 hashing } 
+• admit_id = H( P_policy_admit || canonical(policy_id, context_id, need_id, compat_witness, check) ).
+• If result:"fail", the object must include a smallest counterexample pointer (e.g., an atom not in the selected context or a proof that meet(ctx, need) ≠ need).
+4) Normative mapping: Effects → Policy atoms
+4.1 Mapping rule op_class_atom_v1 (default)
+For each Effect Table entry (op_kind, addr_class, max_total_len):
+• Construct a canonical atom name:
+eff.<op_kind>.<addr_class>
+Examples: eff.mem.write.mem.app, eff.mem.zero.mem.app, eff.mem.write.mem.indices.
+• Need set = the union of atoms for all (op,class) pairs listed by the program (ignoring numeric budgets).
+• Need element = the meet-conjunction of all atoms in that set (i.e., need = ⋀{eff.op.class}).
+Rationale: Admission decides which kinds of effects are allowed (types), not how much (quantities). Quantities are enforced by Slice 6.
+4.2 Alternative mapping rules (reserved)
+• class_only_v1: collapse across ops → eff.<addr_class> atoms.
+• op_family_v1: group op kinds (mem.write|zero|copy → mem.write_any).
+Not enabled by default in v1.0; included here for future versioning.
+5) Context selection & compatibility
+• A context is a named Boolean block chosen from the Policy Snapshot. Inside a context, classical logic applies.
+• Compatibility witness: enough atom identifiers to witness that the need atoms live in the selected context (e.g., all need atoms are members of the block, or an explicit proof object from the Policy Plane).
+• The admission test must be computed as: 
+• Resolve need atom ids from the snapshot (error if any unknown).
+• Confirm compatibility witnesses.
+• Compute meet(ctx, need) inside the Boolean block and verify it equals need.
+• Record both the context_id (hash of the block members) and the compat_witness in the certificate.
+6) Execution-time binding
+• The parity tuple binds policy_id (Slice 4).
+• Engines must gate execution on admit.result == "pass" and bind the specific admit_id into the txn-cert bundle evidence.
+• If the interpreter and staged artifact choose different contexts, admission fails unless both contexts are identical (context_id matches).
+7) Hashing & IDs (DSR-bound)
+• policy_id = H( P_policy_snapshot || canonical(snapshot) ).
+• need_id = H( P_policy_need || canonical(translation, resolved atom ids) ).
+• admit_id = H( P_policy_admit || canonical(policy_id,context_id,need_id,compat_witness,check) ).
+• (Optional) effsig_id = H( P_policy_effsig || canonical(effect signature triples)) (matches Slice 6 §11; tag immu.policy.effsig.v1).
+All preludes use DSR V1 (Slice 3). The snapshot and need must cite the same encoder_id the rest of the EP uses.
+8) Verifier procedure (admission)
+Given an EP with effects_id, policy_id, need_id, and admit_id:
+• Load & hash-check Policy Snapshot, Need, Admission (DSR tags must exist).
+• Rebuild need from effects_id using mapping rule op_class_atom_v1; compare to claimed need_id. If different → POL_E_NEED_DIVERGE.
+• Resolve context by context_id within policy.snapshot; ensure members are known atoms.
+• Compatibility check: 
+• All need atom ids must be members of the selected context’s Boolean block.
+• The compat_witness must be sufficient (or cite a proof object) → else POL_E_INCOMPATIBLE.
+• Admission check: Compute meet(ctx,need) inside the block; require equality to need. If not → POL_E_ADMIT_FAIL.
+• Bind to parity: Ensure the parity tuple’s policy_id equals this snapshot’s policy_id.
+• Effect signature (if present): If effsig_id is used by policy, recompute it from effects_id and compare; else skip.
+If everything passes: admit.result must be "pass". Otherwise reject with a deterministic reason.
+9) Deterministic errors (reason names)
+• POL_E_SCHEMA — unsupported schema for snapshot/need/admit.
+• POL_E_ENCODER — encoder mismatch or non-canonical.
+• POL_E_DSR — missing/unknown DSR tag(s).
+• POL_E_SNAPSHOT_HASH — recomputed policy_id differs.
+• POL_E_NEED_DIVERGE — need recomputed from effects_id disagrees with need_id.
+• POL_E_ATOM_UNKNOWN — a required eff.op.class atom not present in snapshot atoms.
+• POL_E_CONTEXT_UNKNOWN — context_id not in snapshot contexts.
+• POL_E_INCOMPATIBLE — need atoms not members of the chosen Boolean block (no compatibility witness).
+• POL_E_ADMIT_FAIL — meet(ctx,need) != need.
+• POL_E_EFFSIG — (if applicable) policy effect-signature mismatch.
+• POL_E_BINDING — parity tuple’s policy_id does not match the snapshot used for admission.
+Every failure must attach a minimal witness: the missing atom name/id, or the first inequality step (e.g., name of an atom dropped by meet).
+10) Edge cases & corner rules
+• Empty Effect Table ⇒ need = ⊤ (no writes requested). Admission trivially passes for any context that does not ban reads-only states. (You may also treat need = ⊥ by convention; pick one and fix it—this spec uses ⊤ for “no requirements”.)
+• Multiple contexts per run: Allowed only if per-tick admission is implemented and captured (future extension). In v1.0, a run binds a single context_id.
+• Policy evolution: A new Policy Snapshot yields a new policy_id; historical EPs stay verifiable with their old policy_id.
+• Atom granularity: If a policy wants to allow all writes to mem.app regardless of op kind, it can include both eff.mem.write.mem.app and eff.mem.zero.mem.app in its context (or define family atoms; future mapping rule).
+• Need completeness: A program may declare more effect kinds than it actually uses in a specific run; admission is conservative (over-approximation). Actual writes are still checked by Effects Slice 6.
+11) Golden vectors (minimum set)
+Place under golden/policy-admit/v1.0/:
+• Snapshot-A: Atoms {eff.mem.write.mem.app, eff.mem.zero.mem.app, eff.mem.write.mem.indices}; contexts {ctx.default.strict} contains all three. Compute policy_id.
+• Need-A: Effects Table lists exactly those three (op,class) pairs. need_id computed from mapping rule.
+• Admit-Pass: ctx.default.strict chosen; compat_witness.atom_names lists the three atoms; meet(ctx,need)==need → result:"pass".
+• Admit-Fail (missing atom): Snapshot lacks eff.mem.write.mem.indices; recomputed need contains it → POL_E_ATOM_UNKNOWN.
+• Admit-Fail (context): Snapshot has all atoms but chosen context omits eff.mem.zero.mem.app; meet(ctx,need) drops it → POL_E_ADMIT_FAIL.
+• Need-Diverge: Effects Table contains four pairs; provided need_id encodes only three → POL_E_NEED_DIVERGE.
+• Binding-Fail: Parity tuple references policy_id=X, admission uses snapshot policy_id=Y → POL_E_BINDING.
+Each vector includes canonical bytes hex for snapshot, need, admit, their DSR preludes, and expected digests.
+12) Acceptance checks (verifier POV)
+Accept admission iff:
+• Snapshot, Need, and Admission objects hash to their declared IDs and use the required DSR tags.
+• Recomputing need from effects_id under op_class_atom_v1 yields exactly the claimed need_id.
+• Selected context_id belongs to the snapshot and includes (or is compatible with) all need atoms.
+• meet(ctx,need) == need.
+• Parity’s policy_id equals the snapshot’s policy_id.
+• (Optional) Effect signature used by policy matches the Effect Table.
+Reject otherwise with a reason from §9 and a minimal witness.
+13) What this does not change (stability)
+• No changes to Tape, RNG, Effects containment, Capability lineage, or Parity tuple fields.
+• Admission certificates are evidence-first and semantics-inert: they authorize execution but do not affect the state transition function’s purity.
+• Budget enforcement remains in Slice 6; admission is orthogonal.
+End of Slice 8.
+Say continue to proceed. Suggested next tight slices that interlock nicely:
+• Gamepad Map v1.0 (canonicalize gamepad.button/axis like keyboards),
+• Crypto Policy & Multihash v1.0 (which suites are mandatory where; migration), or
+• Per-Tick Admission v1.0 (optional extension for context switching with evidence).
+Slice 9 — Gamepad Map v1.0 (Deterministic Controller→Logical Mapping)
+(Fully expanded, single sealed module. Mirrors Slice 5 for keyboards; plugs into Tape v1.0 gamepad.button / gamepad.axis. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• A hash-pinned Gamepad Map that translates native controller identifiers (HID usages / evdev codes / XInput / Android keycodes/axes) into canonical logical button and axis names.
+• Canonical codesets, axis normalization, dead-zone & calibration, quantization to avoid float drift, pad indexing, verification rules, deterministic errors, and golden vectors.
+Out-of-scope (deferred):
+• Haptics/rumble (actuators; separate “Haptics Map” slice).
+• Gesture layers (touchpad gestures); here we only define button press on touchpad.
+• In-engine input buffering/scheduling (already covered by Tape & Parity slices).
+Depends on:
+• Tape v1.0 (Slice 1) — gamepad.button / gamepad.axis payload shape.
+• DSR v1.0 (Slice 3) — new tags below.
+• Parity v1.1 (Slice 4) — unaffected, Gamepad Map is evidence-only.
+• Canonical serialization (encoder_id) — for all JSON here.
+Stability note: This slice does not alter Tape schema or parity. It standardizes how recorders produce canonical axis/button names and normalized values so verifiers can re-derive the same outputs from native events.
+1) Purpose (one paragraph)
+Different OS APIs label the same physical controls differently (and sometimes swap ABXY). The Gamepad Map fixes that: given a specific device/profile and native codes, it yields canonical logical names and quantized, normalized axis values. Tapes then carry only logical names plus the quantized numeric, making replays identical across hosts. The map is content-addressed so auditors can re-run the translation and confirm every event.
+2) DSR tags (append-only)
+Add to the DSR (Slice 3):
+• immu.gamepad.map.v1 — Gamepad Map object.
+• immu.gamepad.calib.v1 — Per-axis calibration profile.
+• immu.gamepad.padset.v1 — Pad Index Set (stable pad indices ↔ device fingerprints).
+• immu.gamepad.codeset.v1 — Canonical button/axis code table (embedded but also separately addressable).
+Publishing this slice implies a new ds_registry_id that includes the above.
+3) Canonical codesets
+3.1 Buttons (codeset.buttons)
+Lowercase, snake_case, append-only within gp.code.v1.
+Face cluster: face_south, face_east, face_west, face_north
+Shoulders: shoulder_left, shoulder_right
+Triggers (as buttons, optional): trigger_left_btn, trigger_right_btn (only if the device reports digital clicks)
+Sticks (press): stick_left_press, stick_right_press
+D-pad (digital): dpad_up, dpad_down, dpad_left, dpad_right
+Meta/system: start, select, menu, options, share, guide, home, touchpad_press
+Extras: misc_1 … misc_8 (reserved vendor buttons; stable names)
+3.2 Axes (codeset.axes)
+Sticks: lx, ly, rx, ry (normalized to [-1,1], where +x is right, +y is up)
+Triggers (analog): lt, rt (normalized to [0,1])
+D-pad (analog hat, optional): hx, hy (normalized to [-1,1]; if present, digital dpad may be omitted)
+Vendor extras: ax_0 … ax_7 (append-only escape hatch)
+Y sign convention: ly=+1 is upward and ly=-1 is downward. Recorders must invert native Y if needed to satisfy this.
+4) Top-level objects
+4.1 Gamepad Map (gamepad.map.v1.0)
+{ "schema": "gamepad.map.v1.0", "encoder_id": "…", "ds_registry_id": "…", "gamepad_map_id": "…", // §8 hashing "platform": "android|linux|windows|darwin|web", "source_api": "hid.usage|linux.evdev|xinput|android.gamepad|web.gamepad", "profile": "xinput|dualshock4|dualsense|switch_pro|generic_hid|vendor_045e_0b12", "device_fingerprint": { "vendor": "0x045e", "product": "0x0b12", "name": "Example Controller", "os_build": "linux-6.8" }, "codeset": { // embedded normative sets "schema": "gamepad.codeset.v1.0", "version": "gp.code.v1", "buttons": [ "face_south", "face_east", "face_west", "face_north", "shoulder_left", "shoulder_right", "stick_left_press","stick_right_press","dpad_up","dpad_down","dpad_left","dpad_right", "start","select","menu","options","share","guide","home","touchpad_press","misc_1","misc_2" ], "axes": [ "lx","ly","rx","ry","lt","rt","hx","hy" ] }, "quantization": { // §5 "scheme": "int16_unit", "axes": { "stick": {"bits": 16}, // lx,ly,rx,ry in [-1,1] → q ∈ [-32767, +32767] "hat": {"bits": 8}, // hx,hy in [-1,1] → q ∈ [-127, +127] "trig": {"bits": 16} // lt,rt in [0,1] → q ∈ [0, 65535] } }, "calibration_id": "…", // optional per-axis calib (see 4.2) "table_buttons": [ { "native": {"code": 304, "set":"evdev"}, "logical":"face_south" }, { "native": {"code": 305, "set":"evdev"}, "logical":"face_east" }, { "native": {"code": 307, "set":"evdev"}, "logical":"face_west" }, { "native": {"code": 308, "set":"evdev"}, "logical":"face_north" }, { "native": {"code": 310, "set":"evdev"}, "logical":"shoulder_left" }, { "native": {"code": 311, "set":"evdev"}, "logical":"shoulder_right" }, { "native": {"code": 314, "set":"evdev"}, "logical":"select" }, { "native": {"code": 315, "set":"evdev"}, "logical":"start" } // … exhaustive for this profile ], "table_axes": [ { "native": {"axis": 0, "set":"evdev"}, "logical":"lx", "invert": false }, { "native": {"axis": 1, "set":"evdev"}, "logical":"ly", "invert": true }, { "native": {"axis": 2, "set":"evdev"}, "logical":"rx", "invert": false }, { "native": {"axis": 3, "set":"evdev"}, "logical":"ry", "invert": true }, { "native": {"axis": 4, "set":"evdev"}, "logical":"lt", "invert": false }, { "native": {"axis": 5, "set":"evdev"}, "logical":"rt", "invert": false } ], "notes": "ABXY normalized to face_south/east/west/north; Y inverted so +up" } 
+4.2 Calibration (gamepad.calib.v1.0) — optional
+{ "schema": "gamepad.calib.v1.0", "encoder_id": "…", "ds_registry_id": "…", "calibration_id": "…", // §8 hashing "axes": { "lx": {"min": -32768, "max": 32767, "neutral": 0, "dead": 4096, "curve": "linear"}, "ly": {"min": -32768, "max": 32767, "neutral": 0, "dead": 4096, "curve": "linear"}, "rx": {"min": -32768, "max": 32767, "neutral": 0, "dead": 4096, "curve": "linear"}, "ry": {"min": -32768, "max": 32767, "neutral": 0, "dead": 4096, "curve": "linear"}, "lt": {"min": 0, "max": 1023, "neutral": 0, "dead": 8, "curve": "linear"}, "rt": {"min": 0, "max": 1023, "neutral": 0, "dead": 8, "curve": "linear"} } } 
+• min/max/neutral are raw native units for the given source_api.
+• dead is the symmetric dead-zone radius (in raw units) around neutral.
+• curve is linear in v1; non-linear curves (e.g., gamma) are reserved for v1.1.
+4.3 Pad Index Set (gamepad.padset.v1.0) — optional evidence
+{ "schema": "gamepad.padset.v1.0", "encoder_id": "…", "ds_registry_id": "…", "padset_id": "…", // §8 hashing "pads": [ {"pad":0, "profile":"xinput", "device_fingerprint":{"vendor":"0x045e","product":"0x0b12","path":"/dev/input/js0"}}, {"pad":1, "profile":"xinput", "device_fingerprint":{"vendor":"0x045e","product":"0x0b13","path":"/dev/input/js1"}} ], "open_order": ["js0","js1"], "notes": "Stable pad indices for this tape recording session" } 
+• Stabilizes the mapping from OS device IDs to Tape pad indices. Tape stores pad only; this evidence explains where pad=0 came from.
+5) Normalization & Quantization (normative)
+5.1 Axis normalization
+Given a native raw value r and calibration {min, max, neutral, dead}:
+• Dead-zone: if |r − neutral| ≤ dead ⇒ v = 0.
+• Sign & span:
+• For sticks/hat (lx,ly,rx,ry,hx,hy): span_pos = max - neutral, span_neg = neutral - min s = (r - neutral) / (r >= neutral ? span_pos : span_neg) v = clamp(s, -1, +1) 
+• For triggers (lt,rt): span = max - neutral // neutral typically 0 v = clamp( (r - neutral) / span, 0, 1 ) 
+• Invert: if map row says invert:true, set v = -v (sticks/hat only).
+5.2 Quantization int16_unit (default)
+To avoid float drift in Tape:
+• Sticks/hat in [-1,1] → integer q ∈ [-Q,Q], Q = 2^(bits-1)-1 (e.g., 32767 or 127). q = round(v * Q) v_tape = q / Q 
+• Triggers in [0,1] → q ∈ [0, 2^bits - 1] (e.g., 0..65535). q = round(v * (2^bits - 1)) v_tape = q / (2^bits - 1) 
+Canonical encoding in Tape: value is the decimal string (or number per encoder_id) equal to v_tape computed above. Verifiers recompute and demand exact equality.
+6) Tape event contracts (refined)
+• gamepad.axis payload (from Slice 1) becomes fully determined by the Gamepad Map + Calibration:
+{"pad":0,"axis":"lx","value":-0.35} 
+must satisfy exact quantization equality given the map’s quantization and calibration. If not → GPAD_E_QUANT.
+• gamepad.button payload
+{"pad":0,"button":"south","state":"down"} 
+is normalized to canonical logical names from §3.1 (face_south, etc.). (If your existing tapes used "south", recorders must emit "face_south" going forward; a compatibility alias table may be used by verifiers for historical runs.)
+7) Verification rules
+Given a tape and a referenced gamepad_map_id (evidence in manifest.created_by) and optional calibration_id / padset_id:
+• Load & hash-check Gamepad Map (and Calibration/Padset if present).
+• Code existence: For every gamepad.button/gamepad.axis, ensure button/axis is in the map’s codeset (GPAD_E_UNKNOWN_CODE).
+• Button mapping check (if native evidence captured): If events include native.scan/native.code evidence, confirm the row in table_buttons maps it to the same logical (GPAD_E_MAP_MISMATCH).
+• Axis mapping: Resolve the axis row; apply calibration & inversion; compute normalized v and quantized v_tape; demand exact equality with the event’s value (GPAD_E_QUANT).
+• Range checks: value ∈ [-1,1] for sticks/hat; value ∈ [0,1] for triggers; otherwise GPAD_E_RANGE.
+• Pad set (if provided): Confirm each pad index appears in Padset and (optionally) that device fingerprints match (GPAD_E_PAD_INDEX).
+• Monotone ord per tick/source: As Tape requires; unchanged.
+8) Hashing & IDs (DSR-bound)
+• Gamepad Map:
+gamepad_map_id = H( P_gpad_map || canonical(map_json) ), tag immu.gamepad.map.v1.
+• Calibration:
+calibration_id = H( P_gpad_cal || canonical(calib_json) ), tag immu.gamepad.calib.v1.
+• Padset:
+padset_id = H( P_gpad_padset || canonical(padset_json) ), tag immu.gamepad.padset.v1.
+• Codeset (if stored separately):
+codeset_id = H( P_gpad_codeset || canonical(codeset_json) ), tag immu.gamepad.codeset.v1.
+All use the DSR V1 prelude encoding (Slice 3).
+9) Deterministic errors (reason names)
+• GPAD_E_SCHEMA — unsupported schema.
+• GPAD_E_ENCODER — non-canonical bytes.
+• GPAD_E_DSR — unknown/missing DSR tags.
+• GPAD_E_CODESET_DUP — duplicate logical code in codeset.
+• GPAD_E_TABLE_DUP — same (native,set) maps to two different logical names.
+• GPAD_E_UNKNOWN_CODE — tape references a logical button/axis not in codeset.
+• GPAD_E_MAP_MISMATCH — native→logical remap (from evidence) disagrees with event’s logical.
+• GPAD_E_RANGE — tape value outside normalized range.
+• GPAD_E_CALIB — invalid calibration (min≥max, dead≥span, etc.).
+• GPAD_E_QUANT — recomputed quantized value ≠ tape value.
+• GPAD_E_PAD_INDEX — pad index not present in Padset (if Padset provided).
+• GPAD_E_HASH — id mismatch after hashing.
+Each failure returns a minimal witness: event index, native code/axis, expected vs actual logical/value, and the quantization integers (q_expected, q_tape).
+10) Golden vectors (minimum set)
+Place under golden/gamepad/v1.0/:
+• XInput-like profile: Map with table_buttons for ABXY→face_*, shoulders, start/select; table_axes for lx,ly,rx,ry,lt,rt; calibration min/max/neutral typical; compute gamepad_map_id and calibration_id.
+• Quantization check: Raw ly just below neutral inside dead-zone → expect value=0.0. Raw lx near full right → expect q=32767, value=1.0.
+• Trigger linearization: Raw lt=512/1023 → expect q=~32768, value≈0.5000076 (exact per int16_unit), provided as decimal equal to q/(2^16-1).
+• Alias fail: Tape uses button:"south" with map codeset requiring face_south → GPAD_E_UNKNOWN_CODE (unless historical alias mode).
+• Map mismatch: Evidence says native 304/evdev but event has logical:"face_north" → GPAD_E_MAP_MISMATCH.
+• Padset check: Tape uses pad:1 but Padset lists only pad:0 → GPAD_E_PAD_INDEX.
+Each vector stores: canonical bytes hex, DSR preludes, and expected digests; plus a small set of raw→normalized→quantized computations.
+11) Interaction with other planes
+• Tape v1.0:
+• Enforces axis/button names from codesets and exact quantization.
+• pad indices are purely logical; Padset evidence explains their origin.
+• Parity / Effects / Policy:
+• Unchanged; input events influence state through program logic; parity binds through Tape ID.
+• If policy constrains input domains, that happens at a higher level (not here).
+• Godot integration:
+• Map Godot’s gamepad API codes through this table; invert Y to our convention; supply quantized floats.
+12) Edge cases & corner rules
+• Devices without analog triggers: Map triggers as buttons only (trigger_left_btn/trigger_right_btn) and omit lt/rt axes.
+• Hats reported both as digital and analog: Prefer digital dpad if both exist; if analog hx/hy is used, omit dpad buttons for the same device to avoid double events.
+• Non-linear hardware: Keep curve:"linear" in v1; if you must compensate, pre-linearize raw inputs into an equivalent linear min/max range and document in notes.
+• Multiple devices hot-swap: Tape is authoritative. If pad indices change mid-session, segment the tape and emit a new Padset evidence with updated mapping.
+• Historical tapes: If earlier recordings used slightly different names (south vs face_south), verifiers may load a compat alias table (evidence-only) to rewrite at audit time; new recordings must use v1 codesets.
+13) Acceptance checks (verifier POV)
+Accept a Gamepad Map (and uses of it) iff:
+• Map/Calibration/Padset hash to their declared IDs and use valid DSR tags.
+• Codesets contain unique, grammar-valid names.
+• Mapping tables cover all native inputs the recorder claims to have used; no duplicate conflicts.
+• Calibration spans & deads are sane.
+• For each gamepad.axis/button event, re-mapping and quantization reproduce the tape fields exactly.
+• If Padset is present, all pad indices in the tape are listed.
+Reject otherwise with reasons in §9 and a minimal witness.
+14) What this does not change (stability)
+• No changes to Tape schema, Parity fields, Effects, Capabilities, or OML admission.
+• Does not introduce executor identity or per-host variance; all conversions are structural and evidence-driven.
+• Does not require shipping vendor trademarks; profile is a stable mapping label only.
+End of Slice 9.
+Say continue to proceed. Natural next slices:
+• Crypto Policy & Multihash v1.0 (what suites must appear where; dual-stack periods),
+• Haptics Map v1.0 (deterministic actuator commands as effects-free evidence), or
+• Per-Tick Admission v1.0 (context switches with evidence).
+Slice 10 — Crypto Policy & Multihash v1.0
+(Fully expanded, single sealed module. Builds on Slices 1–9. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• A normative crypto policy that declares which hash suites are permitted and which are required for specific artifact classes (parity tuples, registries, proofs, maps, etc.).
+• Canonical suite names, output lengths, and encoding rules.
+• A sealed, evidence-first Multihash Attestation object that carries additional digests for the same canonical bytes without changing the artifact schemas.
+• Dual-stack migration (old+new suites), retirement, validation rules, deterministic errors, and golden vectors.
+Out-of-scope (deferred): MAC/signature policy, key hierarchy, and transport-security requirements (those live in Upgrade & EP signing slices). This slice is hashing only.
+Depends on:
+• DSR v1.0 (Slice 3) — suite-independent prelude discipline; we add tags here.
+• Canonical encoding (encoder_id).
+• All slices that define per-object IDs (Tape, Parity, Effects, Capabilities, Policy, Input/Gamepad Map, etc.). We do not change their bytes; we only standardize how to add extra suite digests.
+Stability note: No program semantics, parity composition, or determinism changes. This slice only regulates which digests must accompany a given artifact and how to attest them.
+1) Purpose (one paragraph)
+Hash agility without drift: every content-addressed object already hashes P||B (DSR prelude + canonical bytes). Crypto Policy fixes which suites must be present for each artifact class now, and how to provide additional suites in a sealed Multihash Attestation so verifiers can require one or more digests—with zero changes to the artifact’s schema or ID rules.
+2) Canonical suite registry (normative)
+We define suite names, digest sizes, and output encodings:
+Suite nameDigest bitsOutput encodingString formblake3256lowercase hexblake3:<64-hex>sha256256lowercase hexsha256:<64-hex>sha3-256256lowercase hexsha3-256:<64-hex> 
+Rules
+• Names are lowercase ASCII; append-only.
+• Encodings are exact: no 0x prefix, no uppercase, fixed width.
+• Forbidden (MUST NOT): md5, sha1.
+• Engines may compute more suites than policy requires; only required suites are enforced at verification time.
+3) Artifact classes & required suites
+We classify artifacts so policy can target them precisely:
+Class IDDescription (examples)commit.coreParity tuple, DSR registry, Effects Ontology/Table/ClassMap, Capability Proof/Snapshot, Policy Snapshot/Need/Admission, Input Map, Gamepad Mapcommit.auxTick parity, write-set digest, effect signature, padset/calibrationmanifest.epEP manifests (manifest.json, manifest.sig references)evidence.runRun transcripts, sensor/PCV windows, instrumentation profiles 
+Default policy v1.0 (this slice):
+• commit.core: REQUIRE blake3 AND sha256
+• commit.aux: REQUIRE blake3 (RECOMMEND sha256)
+• manifest.ep: REQUIRE sha256 (RECOMMEND blake3)
+• evidence.run: PERMIT blake3|sha256; no hard requirement
+Rationale: dual-stack on core commitments gives crypto redundancy without touching schemas. EP manifests retain conservative sha256 primacy for broad tooling.
+4) DSR tags added (append-only)
+• immu.crypto.policy.v1 — Crypto Policy object.
+• immu.mh.attest.v1 — Multihash Attestation object.
+• immu.mh.coverage.v1 — Coverage set (binds attestations to classes/objects, optional index).
+Publishing this slice implies a new ds_registry_id that includes these tags.
+5) Crypto Policy object
+File: crypto.policy.v1.0.json
+{ "schema": "crypto.policy.v1.0", "encoder_id": "…", "ds_registry_id": "…", "policy_crypto_id": "…", // §9 hashing "suites": ["blake3","sha256","sha3-256"],// permitted set "required": [ {"class":"commit.core","need":["blake3","sha256"]}, {"class":"commit.aux","need":["blake3"]}, {"class":"manifest.ep","need":["sha256"]} ], "timeline": { // migration controls "phase": "dual", // "single"|"dual"|"cutover" "primary": "blake3", // preferred display/base "not_before": "2025-01-01T00:00:00Z", // advisory, evidence-only "not_after": null // optional retirement date }, "notes": "Forest-of-Light CP v1.0: core dual-stack blake3+sha256" } 
+Semantics
+• suites: global allowlist; any digest outside is rejected.
+• required: per-class must-include suites verifiers enforce.
+• timeline.phase: 
+• single: one required suite only.
+• dual: two (or more) required suites; both must verify.
+• cutover: new primary is displayed/anchored; old may be retired per not_after. (Retirement logic is strictly verifier-side; artifacts remain immutable.)
+6) Multihash Attestation (no schema changes to artifacts)
+Because many artifacts already have a single suite/…_id field (e.g., Parity v1.1), we do not alter them. Instead, we bind extra digests with a sealed, separate attestation.
+File: mh.attest.v1.0.json
+{ "schema": "mh.attest.v1.0", "encoder_id": "…", "ds_registry_id": "…", "mh_id": "…", // §9 hashing "target": { "tag": "immu.parity.tuple.v1", // DSR tag of the target object "primary_suite": "blake3", "primary_id": "blake3:…", // the id already present in the object "bytes_len": 1234 // canonical bytes length (evidence) }, "digests": [ {"suite":"blake3", "id":"blake3:…"}, // MUST match primary_id {"suite":"sha256", "id":"sha256:…"}, {"suite":"sha3-256","id":"sha3-256:…"} // optional if permitted ], "coverage": "commit.core", // which class the target belongs to "bind_refs": { "object_cas": "cas://…", // optional pointer to the canonical bytes "object_ep_path": "evidence/…/parity.json" } } 
+Rules
+• target.primary_id must equal the digest computed from the actual target bytes under primary_suite.
+• All digests[*].id are recomputed by verifiers as H_suite( prelude(tag) || canonical(bytes) ).
+• No new fields are added to the target artifact; the attestation lives in the EP evidence and is referenced from indexes (or discoverable by tag+primary_id).
+7) Coverage Index (optional)
+To accelerate verification in large EPs:
+File: mh.coverage.v1.0.json
+{ "schema": "mh.coverage.v1.0", "encoder_id": "…", "ds_registry_id": "…", "coverage_id": "…", // §9 hashing "policy_crypto_id": "…", "entries": [ {"coverage":"commit.core","mh_ids":["…","…","…"]}, {"coverage":"commit.aux","mh_ids":["…","…"]} ] } 
+Verifiers may load this index to locate all attestations; absence of the index is not an error if the required attestations are otherwise present.
+8) Conformance matrix (what must appear where)
+For each artifact instance in an EP:
+• Determine its class (table in §3).
+• Check the crypto policy required suites for that class.
+• Accept if either: 
+• The artifact itself natively carries all required suites (rare), or
+• There exists at least one mh.attest.v1.0 that targets this artifact and lists all required suites with correct digests.
+Parity v1.1, Effects, Capability Proofs, Policy Snapshot, Input/Gamepad Maps: provide one native id + an attestation adding the other required suites.
+9) Hashing & IDs (DSR-bound)
+• Crypto Policy:
+policy_crypto_id = H( P_crypto_policy || canonical(policy_json) ), tag immu.crypto.policy.v1.
+• Multihash Attestation:
+mh_id = H( P_mh_attest || canonical(attest_json) ), tag immu.mh.attest.v1.
+• Coverage Index:
+coverage_id = H( P_mh_coverage || canonical(coverage_json) ), tag immu.mh.coverage.v1.
+All use DSR V1 prelude; all strings lower-case; hex strict width.
+10) Verifier procedure (policy compliance)
+Given an EP and a Crypto Policy:
+• Load policy; verify policy_crypto_id and that every suite in required[].need appears in suites.
+• For every artifact instance in commit.core|commit.aux|manifest.ep: 
+• Identify its DSR tag and primary id (from the artifact).
+• Collect candidate mh.attest.v1.0 objects with target.tag and target.primary_id matching.
+• For each required suite, recompute the digest from the artifact’s bytes (using the tag’s prelude) and compare with the attestation’s digests entry.
+• Fail if any required suite is missing or mismatched.
+• Optional: cross-check coverage classes via mh.coverage.v1.0.
+• Enforce timeline if verifier is configured to honor dates (advisory by default).
+11) Deterministic errors (reason names)
+• CRYPTO_E_SCHEMA — unsupported policy/attest/coverage schema.
+• CRYPTO_E_ENCODER — non-canonical encoding.
+• CRYPTO_E_DSR — missing/unknown DSR tags.
+• CRYPTO_E_SUITE_FORBID — artifact/attestation uses a suite not in policy suites.
+• CRYPTO_E_REQ_MISSING — a required suite for the artifact’s class is not provided.
+• CRYPTO_E_DIGEST_MISMATCH — recomputed digest != attested.
+• CRYPTO_E_TARGET_TAG — attestation target.tag does not match the artifact’s tag.
+• CRYPTO_E_PRIMARY_MISMATCH — target.primary_id does not equal the artifact’s native id.
+• CRYPTO_E_CLASS_UNKNOWN — artifact could not be classified to a known class.
+• CRYPTO_E_COVERAGE_INCOMPLETE — (optional) coverage index omits an artifact that is present and required.
+• CRYPTO_E_POLICY_SUITE — required[].need includes a suite not in suites.
+Each failure must include a minimal witness: artifact tag + primary id, missing suite name (or mismatched hex prefix), and byte length used for recomputation.
+12) Migration playbook (deterministic, evidence-first)
+Goal: Move from sha256-only → blake3+sha256 → blake3-primary without breaking verifiers.
+• Phase: single (legacy)
+• Policy requires only sha256. Artifacts unchanged.
+• Phase: dual (this slice default)
+• Policy requires sha256 and blake3.
+• For each artifact: keep native primary id as currently defined (could be blake3 or sha256 per artifact spec), and add an attestation providing the other suite.
+• EP includes crypto.policy.v1.0.json and mh.attest.v1.0.json objects.
+• Phase: cutover
+• Policy sets primary:"blake3"; verifiers may prefer displaying blake3: and warn if sha256 is missing after not_after.
+• Artifacts remain immutable; only verifier policy changes.
+• Retirement
+• When sha256 is retired, required for commit.core may shrink to only blake3. Historic EPs still validate under their embedded policy snapshot or verifier’s “historical policy” mode.
+All steps are offline and replayable; no runtime nondeterminism introduced.
+13) Golden vectors (minimum set)
+Place under golden/crypto/v1.0/:
+• Bytes-A: Canonical parity tuple from Slice 4 vectors. Provide:
+• blake3 digest, sha256 digest over the same prelude+bytes.
+• mh.attest.v1.0.json binding both digests.
+• Expected mh_id.
+• Bytes-B: Effects Table JSON (Slice 6). Provide dual digests and attestation.
+• Policy-A: crypto.policy.v1.0.json as in §5. Provide policy_crypto_id.
+• Coverage-A: Index that lists the attestations for (1) and (2). Provide coverage_id.
+• Mismatch case: Alter one hex nibble in an attested digest → expect CRYPTO_E_DIGEST_MISMATCH.
+• Missing suite: Remove sha256 from a commit.core attestation → expect CRYPTO_E_REQ_MISSING.
+Each vector includes canonical bytes hex, both preludes, and all expected digests.
+14) Interaction with other slices
+• DSR (Slice 3): Unchanged prelude; policy simply requires multiple suites over the same prelude+bytes.
+• Parity (Slice 4): Keep suite + parity_id as-is. Add a multihash attestation to satisfy additional suites.
+• Effects/Capabilities/Policy (Slices 6–8): Same pattern.
+• Input/Gamepad Maps (5 & 9): Same pattern; attestations ride in EP evidence.
+• Upgrade Plane: Bundle manifests remain sha256-anchored by default; add blake3 attestations to the bundle manifest.
+15) What this does not change (stability)
+• No changes to the canonical bytes of any artifact.
+• No changes to parity/gas/effects semantics or IDs already minted.
+• No executor identity or time-dependent behavior introduced.
+• No mandatory internet or external keystore lookups; everything is sealed in EP evidence.
+End of Slice 10.
+Say continue to proceed. Natural next slices that dovetail:
+• Per-Tick Admission v1.0 (segment contexts across frames with witnesses),
+• Haptics Map v1.0 (deterministic actuator commands as evidence-only outputs), or
+• PCV v1.0 (Physical Context Vector) (formalizing the instrumentation snapshot object you’ll bind into parity).
+Slice 11 — PCV v1.0 (Physical Context Vector) & Instrumentation Profile
+(Fully expanded, single sealed module. Builds on Slices 1–10. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• A sealed Instrumentation Profile that specifies what to measure, how to sample/quantize, and how to align samples.
+• A sealed PCV Window object (aggregated “snapshot window” of physical readings) and an optional PCV Series (ordered windows).
+• A sealed, semantics-inert Energy Model Profile (linear/affine forms) that turns PCV features into reproducible energy estimates (ties to energy_profile_id in Parity v1.1).
+• DSR tags, canonical encodings, validation rules, deterministic errors, and golden vectors.
+Out-of-scope (deferred): Scheduling algorithms themselves (you may consume PCV in schedulers as exogenous evidence). Actuator control (e.g., power capping) lives elsewhere. Any change to program semantics, gas, effects, parity—none here.
+Depends on:
+• DSR v1.0 (Slice 3) — we consume the two tags pre-reserved there and add two more.
+• Parity v1.1 (Slice 4) — we bind energy_profile_id (semantics-inert).
+• Tape v1.0 (Slice 1) — optional tick anchoring for windows (no requirement).
+• Crypto Policy v1.0 (Slice 10) — multihash attestations as needed.
+• Canonical serialization (encoder_id).
+Stability note: PCV is evidence-only; it must never alter the state-transition function. Using PCV to steer scheduling is allowed only as a pure function of PCV whose choice is captured as evidence (see §10).
+1) Purpose (one paragraph)
+PCV makes the physical context auditable without injecting nondeterminism: sensors (battery, thermals, CPU freq residency, storage pressure, etc.) are sampled per a sealed profile, aggregated into windows, quantized, and stored in CAS. Schedulers can consult these windows (as exogenous inputs, like Tape) and emit their own sealed scheduling decision records. Verifiers can reproduce all derived metrics from raw samples and confirm that any scheduler decisions match the declared rules.
+2) DSR tags (append-only)
+Add (or confirm) the following tags in the DSR:
+• immu.instrument.profile.v1 — Instrumentation Profile object. (pre-reserved in Slice 3)
+• immu.instrument.pcv.v1 — PCV Window object. (pre-reserved in Slice 3)
+• immu.instrument.series.v1 — PCV Series object (ordered windows). (new)
+• immu.instrument.energy.v1 — Energy Model Profile object (semantics-inert). (new)
+Publishing this slice implies a new ds_registry_id that includes the two new tags.
+3) Instrumentation Profile (instr.profile.v1.0)
+A sealed contract for sampling & aggregation.
+{ "schema": "instr.profile.v1.0", "encoder_id": "…", "ds_registry_id": "…", "profile_id": "…", // §7 hashing "samplers": [ { "name": "battery", "measure": ["pct","ma","mv","temp_c"], "source": "android.battery|linux.power_supply", "rate_hz": 1.0, "quant": { "pct_dp": 2, "ma_step": 1, "mv_step": 1, "temp_milliC": true } }, { "name": "cpufreq", "measure": ["residency"], "source": "linux.cpufreq|android.cpu_stats", "rate_hz": 2.0, "quant": { "bucket_ms": 100 } // residency accumulation step }, { "name": "thermal", "measure": ["cpu0","cpu1","battery","skin"], "source": "android.thermal|linux.thermal_zone", "rate_hz": 1.0, "quant": { "temp_milliC": true } }, { "name": "storage", "measure": ["bytes_free","inode_free","io_read_bytes","io_write_bytes"], "source": "linux.procfs|android.statsd", "rate_hz": 0.5, "quant": { "bytes_step": 4096 } }, { "name": "mem", "measure": ["rss_bytes","swap_bytes"], "source": "linux.procfs", "rate_hz": 1.0, "quant": { "bytes_step": 4096 } } ], "windowing": { "mode": "ticks|seconds", // normative: pick exactly one "size": 60, // 60 ticks or 60 seconds "align": "left", // left-closed, right-open windows [k*size, (k+1)*size) "overlap": 0 // 0 for non-overlap; future: allow 50% etc. }, "features": [ // derived features each window must compute {"name":"batt_pct_mean", "from":"battery.pct", "agg":"mean"}, {"name":"batt_ma_mean", "from":"battery.ma", "agg":"mean"}, {"name":"temp_cpu_max", "from":"thermal.cpu*", "agg":"max"}, {"name":"temp_batt_max", "from":"thermal.battery","agg":"max"}, {"name":"cpu_busy_ratio","from":"cpufreq.residency","agg":"sum_ratio", "params":{"buckets":[">70%"]}}, {"name":"io_w_mb", "from":"storage.io_write_bytes","agg":"delta_sum","scale":1048576}, {"name":"io_r_mb", "from":"storage.io_read_bytes","agg":"delta_sum","scale":1048576}, {"name":"rss_mb", "from":"mem.rss_bytes","agg":"mean","scale":1048576} ], "units": { // SI units for each feature "batt_pct_mean":"percent", "batt_ma_mean":"mA", "temp_cpu_max":"milliC", "temp_batt_max":"milliC", "cpu_busy_ratio":"unit", "io_w_mb":"MB", "io_r_mb":"MB", "rss_mb":"MB" }, "quantization": { "percent_dp": 2, // 0.01% "milliC_step": 100, // 0.1°C "ratio_dp": 4, "MB_dp": 3 }, "notes": "Forest-of-Light default phone profile" } 
+Rules (normative):
+• A profile fixes sensor list, rates, windowing, features, units, quantization.
+• The recorder must adhere exactly; any missing sampler ⇒ PCV_E_SAMPLER_MISS.
+• windowing.mode chooses the anchor: Tape ticks or elapsed seconds. If ticks, recorder must supply the current tick index; if seconds, the recorder supplies a monotone run-relative second count (not wall clock). Absolute wall time may be logged under host_time in windows as evidence-only.
+4) PCV Window (instr.pcv.v1.0)
+An aggregated, quantized snapshot for one window.
+{ "schema": "instr.pcv.v1.0", "encoder_id": "…", "ds_registry_id": "…", "profile_id": "…", "anchor": { "mode": "ticks|seconds", "start": 120, // first tick idx or second idx (inclusive) "size": 60 // echo from profile.windowing.size }, "features": { "batt_pct_mean": 78.35, "batt_ma_mean": -420.0, "temp_cpu_max": 58500, "temp_batt_max": 43200, "cpu_busy_ratio": 0.2741, "io_w_mb": 6.125, "io_r_mb": 0.000, "rss_mb": 247.312 }, "raw_hashes": { // optional: rolling hashes for raw sample logs (evidence) "battery": "blake3:…", "thermal": "blake3:…", "cpufreq": "blake3:…", "storage": "blake3:…", "mem": "blake3:…" }, "pcv_id": "…" // §7 hashing } 
+Rules:
+• All features must be present, quantized exactly as the profile dictates.
+• Units are as declared in the profile.
+• If a sampler reported no data in the window, the recorder either (a) omits dependent features and marks the window invalid (future extension), or (b) emits zeros only if the feature’s aggregator defines a zero identity; otherwise raise PCV_E_NODATA.
+• pcv_id is computed from canonical bytes with DSR tag immu.instrument.pcv.v1.
+5) PCV Series (instr.series.v1.0) — optional
+An ordered coverage of windows for a run.
+{ "schema": "instr.series.v1.0", "encoder_id": "…", "ds_registry_id": "…", "profile_id": "…", "coverage": {"mode":"ticks","start":0,"end":600}, // right-open "windows": ["…","…","…"], // array of pcv_id "series_id": "…" // §7 hashing } 
+Rules:
+• Windows must be contiguous, non-overlapping, same size & mode as the profile.
+• Missing windows in the coverage ⇒ PCV_E_HOLE.
+• Series is evidence-only; schedulers may reference a window or a series by id.
+6) Energy Model Profile (instrument.energy.v1.0) — semantics-inert
+A reproducible function from PCV features to scalar energy (e.g., Joules) or vector (per-subsystem).
+{ "schema": "instrument.energy.v1.0", "encoder_id": "…", "ds_registry_id": "…", "energy_profile_id": "…", // this is what Parity v1.1 binds "profile_id": "…", // Instr Profile it expects features from "model": { "kind": "linear", // v1: linear/affine only "target": "joules", // or "mWh" "bias": 0.0, "weights": { "batt_ma_mean": -0.0036, // J/s per mA * window_seconds (see below) "cpu_busy_ratio": 0.75, "temp_cpu_max": 0.0002, "io_w_mb": 0.12, "io_r_mb": 0.10, "rss_mb": 0.005 }, "window_seconds": 60 // interpret weights consistently }, "notes": "Toy model; negative mA = discharge" } 
+Semantics:
+• Given a window with features x_i, compute E = bias + Σ w_i * φ_i(x_i). The φ_i are identity unless specified (e.g., convert mA to J using w * window_seconds).
+• Models are evidence-only; using them to gate execution is a policy choice captured elsewhere.
+• Multiple models may exist; Parity binds which model was in effect (energy_profile_id) without changing semantics.
+7) Hashing & IDs (DSR-bound)
+• profile_id = H( P_instr_profile || canonical(profile_json) ), tag immu.instrument.profile.v1.
+• pcv_id = H( P_instr_pcv || canonical(pcv_window_json) ), tag immu.instrument.pcv.v1.
+• series_id = H( P_instr_series || canonical(series_json) ), tag immu.instrument.series.v1.
+• energy_profile_id = H( P_instr_energy || canonical(energy_profile_json) ), tag immu.instrument.energy.v1.
+All use DSR V1 prelude; numbers are canonicalized per encoder_id (minimal decimals; integers where declared).
+8) Quantization & Aggregation (normative)
+8.1 Battery
+• pct quantized to percent_dp decimals (e.g., 2 → 0.01%).
+• ma, mv step sizes per quant (e.g., 1 mA, 1 mV).
+• temp_c reported as milliC integers.
+Aggregators: mean = arithmetic mean over the window; delta_sum (for counters) = last−first if counters are monotone nondecreasing, else PCV_E_COUNTER_WRAP.
+8.2 CPU freq residency
+• Recorder accumulates per-core residency over standard CPU freq buckets using bucket_ms.
+• cpu_busy_ratio feature: sum( time_above_70pct_of_max_freq ) / window_seconds. Buckets or alternative thresholds are encoded in features[].params.
+8.3 Thermal
+• Temperatures in milliC. Aggregators: max, mean.
+8.4 Storage I/O & space
+• io_read_bytes, io_write_bytes as monotone counters; use delta_sum.
+• bytes_free, inode_free as gauge; use mean or report end-of-window only (choose in profile).
+8.5 Memory
+• rss_bytes, swap_bytes as gauges; mean or max per profile.
+General rule:
+• If a measure is a counter, use delta_sum unless otherwise specified.
+• If a measure is a gauge, use mean, max, or min per profile.
+• After aggregation, quantize per quantization rules into the window’s features.
+9) Verification (acceptance)
+Given a profile, a window (or series), and optionally an energy model:
+• Hash checks: All IDs recompute under their DSR tags; suites meet Crypto Policy.
+• Profile adherence: Each window references the exact profile_id; anchor.mode/size match profile.windowing.
+• Coverage (series): Windows are contiguous, non-overlapping, and cover coverage exactly.
+• Feature set: Window has all features declared by the profile; no extras.
+• Aggregation reproducibility: Recompute features from raw logs if raw_hashes are provided; otherwise (evidence-lite) verify internal consistency: counters nondecreasing, deltas nonnegative, quantization exact.
+• Units & quantization: Values respect declared units and quantization steps.
+• Energy model (if used): Recompute E from window features; any published E in evidence must match exactly.
+Accept iff all pass; otherwise raise deterministic errors (§11) with a minimal witness.
+10) Using PCV safely (determinism guardrails)
+• Semantics-inert: PCV data must not alter the interpreter/staged state transition. If a scheduler uses PCV to choose between allowed interpreter/staged or to time execution, it must:
+• Record the scheduler rule set (pure function over PCV features),
+• Record the inputs (PCV window ids), and
+• Emit a sealed Scheduling Decision Record (future sched.decision.v1.0 slice) proving the choice.
+Program semantics remain unchanged; only when or which executor ran is influenced; parity stays identical.
+• No wall-clock dependency: If windowing.mode="seconds", use a run-relative monotone counter (seconds since run start), not system wall time. Wall time may be included as evidence.host_time (non-normative).
+11) Deterministic errors (reason names)
+• PCV_E_SCHEMA — unsupported schema (profile/pcv/series/energy).
+• PCV_E_ENCODER — non-canonical bytes.
+• PCV_E_DSR — missing/unknown DSR tag(s).
+• PCV_E_SAMPLER_MISS — required sampler absent in the window’s raw coverage.
+• PCV_E_FEATURE_MISS — required feature missing from features.
+• PCV_E_FEATURE_EXTRA — unexpected feature present.
+• PCV_E_WINDOW_ALIGN — anchor not aligned to profile windowing.
+• PCV_E_HOLE — coverage gap in a series.
+• PCV_E_COUNTER_WRAP — counter decreased without explicit wrap policy.
+• PCV_E_QUANT — value violates quantization step/precision.
+• PCV_E_UNIT — units mismatch or out of physical range (e.g., pct > 100).
+• PCV_E_RATE — sampler rate deviates beyond tolerance (derived from raw timestamps if available).
+• PCV_E_MODEL — energy recomputation mismatch.
+• PCV_E_HASH — id mismatch after hashing.
+Each failure carries a minimal witness: sampler/feature name, window anchor, expected vs actual value/step/range.
+12) Golden vectors (minimum set)
+Place under golden/pcv/v1.0/:
+• Profile-A: Exactly the JSON in §3 → profile_id.
+• Window-A (ticks): anchor:{mode:"ticks",start:120,size:60} with the features in §4 → pcv_id.
+• Series-A: Three consecutive windows covering ticks [120,300) → series_id.
+• Energy-A: Linear model in §6 → energy_profile_id; recompute E for Window-A (store expected scalar).
+• Quant-fail: Same window but change temp_cpu_max by 1 mC when milliC_step=100 → PCV_E_QUANT.
+• Counter-wrap: Decrease io_write_bytes mid-window without wrap evidence → PCV_E_COUNTER_WRAP.
+• Hole-fail: Series missing the middle window → PCV_E_HOLE.
+Each vector includes canonical bytes hex, DSR preludes, and expected digests (plus, where applicable, expected energy scalar).
+13) Interaction with other planes
+• Parity (Slice 4): Binds energy_profile_id only; parity bytes do not include PCV ids.
+• Effects/Capabilities/Policy: Unchanged. PCV can inform policies/schedulers but cannot grant permissions or change effect containment.
+• EP (Explainer Pack): Place profile, windows, series, and energy model under evidence/instrumentation/…. Index them from the run manifest.
+• Transport/Storage: PCV objects are regular CAS blobs; deduplicate across runs.
+14) What this does not change (stability)
+• No changes to program semantics, gas, effects, parity, capability lineage, or policy admission.
+• No runtime nondeterminism introduced; all time anchoring is relative or tick-based.
+• No dependency on specific OS APIs; source names are hints; only the values and profile are normative.
+End of Slice 11.
+Say continue to proceed. Suggested next precise slices that dovetail:
+• Scheduling Decision Record v1.0 (deterministic, evidence-first gating over PCV),
+• Haptics Map v1.0 (deterministic actuator commands as evidence-only), or
+• Per-Tick Admission v1.0 (if you want contexts to change across frames).
+
