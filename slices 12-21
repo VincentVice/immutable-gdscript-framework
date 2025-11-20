@@ -1,0 +1,1399 @@
+
+Slice 12 — Scheduling Decision Record (SDR) v1.0
+(Fully expanded, single sealed module. Builds on Slices 1–11. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• A sealed, pure rule specification for scheduling (what inputs, which outputs).
+• A sealed Decision Record showing exactly how a rule evaluated on specific inputs (PCV windows, tape/tick anchors, effect/policy facts) to choose when/how to execute.
+• An optional Plan (ordered decisions over a coverage range).
+• DSR tags, canonical encodings, hashing, verification, errors, and golden vectors.
+Out-of-scope (deferred):
+• Any change to program semantics, parity, effects, gas, or policy.
+• Runtime “controllers” that mutate rule weights from the network/time. (Rules are sealed; changes require a new ruleset_id.)
+• Actuation beyond allowed knobs (we strictly bound outputs to keep semantics inert).
+Depends on:
+• Tape v1.0 (Slice 1) — optional tick anchoring.
+• Parity v1.1 (Slice 4) — unchanged; SDR is evidence-only.
+• Effects/Capabilities/Policy (Slices 6–8) — read-only references.
+• PCV v1.0 (Slice 11) — primary inputs to rules.
+• Crypto Policy & DSR (Slices 10 & 3) — hashing and multihash attestations.
+• Canonical serialization (encoder_id).
+Stability note: SDR introduces no nondeterminism: rules are pure functions over sealed inputs; decisions are recorded before/alongside execution and are independently re-evaluable.
+1) Purpose (one paragraph)
+The SDR binds scheduling choices (executor selection, start time offsets, throttle caps) to a sealed ruleset and sealed inputs (PCV windows, policy/effects facts). Verifiers recompute the rule, obtain the same output, and confirm the run respected the chosen configuration. You get adaptive, battery/thermal-aware execution without altering state transitions or parity.
+2) DSR tags (append-only)
+• immu.sched.rules.v1 — Scheduling Ruleset.
+• immu.sched.decision.v1— Scheduling Decision Record.
+• immu.sched.plan.v1 — Scheduling Plan (ordered decisions).
+Publishing this slice implies a new ds_registry_id that includes these tags.
+3) Allowed inputs (rules can read only these)
+• PCV features from one or more PCV Windows (pcv_id, Slice 11).
+• Run invariants: effects_id, classmap_id, policy_id, parity_id (read-only identifiers).
+• Tape anchor: current tick or run_seconds (monotone, run-relative, not wall clock).
+• Executor capabilities: constant facts such as has_staged=true/false, staged_parity_ok=true/false.
+• Operator constants: sealed numbers/thresholds in the ruleset (e.g., batt_pct_min).
+Forbidden inputs: wall-clock time, RNG, network responses, host identity, environment variables, process lists, or any mutable external state not sealed in CAS. Using them ⇒ SDR_E_NONPURE.
+4) Allowed outputs (what scheduling may change)
+A rule produces a Run Configuration:
+{ "executor": "interpreter|staged", "start": {"mode":"ticks|seconds","offset": 0}, // ≥ 0 "limits": { "cpu_share_pct": null|integer, // 1..100 (advisory) "freq_cap_pct": null|integer, // 1..100 (advisory) "io_write_mbps": null|number, // advisory "cooldown_seconds": null|integer // advisory }, "explain": "short operator-facing reason string" } 
+Semantics guardrails:
+• executor may be "staged" only if staged parity equals interpreter parity (already enforced elsewhere).
+• start.offset does not alter the transition function; it merely chooses when to execute within the same EP.
+• limits.* are advisory to the runtime; whether honored or not, program output must remain identical. If the runtime cannot honor a limit, it must note this in evidence but must not change semantics.
+5) Ruleset (sealed & pure)
+File: sched.rules.v1.0.json
+{ "schema": "sched.rules.v1.0", "encoder_id": "…", "ds_registry_id": "…", "ruleset_id": "…", // §9 hashing "inputs": { "pcv_profile_id": "…", // PCV profile the rules expect "pcv_features": [ // features this ruleset may read "batt_pct_mean","temp_cpu_max","cpu_busy_ratio","io_w_mb" ], "constants": { // operator-tuned knobs (sealed) "min_batt_pct": 25.00, "max_temp_mC": 60000, "busy_hi": 0.70, "cooldown_secs": 120 } }, "eligibility": { // optional: require facts before any rule fires "staged_ok": true, // if true, require staged parity validated to allow staged "policy_id": "…", // if present, require match with this policy "effects_id": null // null = no pin; else must match }, "action_space": { // the discrete choices this ruleset may emit "executors": ["interpreter","staged"], "start_modes": ["ticks","seconds"], "limits": { "cpu_share_pct": {"min":10,"max":90,"step":10}, "freq_cap_pct": {"min":50,"max":100,"step":10}, "io_write_mbps": {"min":1,"max":50,"step":1}, "cooldown_seconds": {"enum":[0,60,120,300]} } }, "logic": { // JSON AST (pure) "kind":"if_chain", "clauses":[ { "if": {"all":[ {"<=":["temp_cpu_max",59000]}, {">=":["batt_pct_mean","min_batt_pct"]}, {"<=":["cpu_busy_ratio","busy_hi"]} ]}, "then": {"executor":"staged","start":{"mode":"ticks","offset":0}, "limits":{"cpu_share_pct":80,"freq_cap_pct":100,"cooldown_seconds":0}, "reason":"cool & charged → staged now"} }, { "if": {"any":[ {">":["temp_cpu_max","max_temp_mC"]}, {"<":["batt_pct_mean","min_batt_pct"]} ]}, "then": {"executor":"interpreter","start":{"mode":"seconds","offset":120}, "limits":{"cpu_share_pct":40,"freq_cap_pct":70,"cooldown_seconds":"cooldown_secs"}, "reason":"hot or low battery → defer & throttle"} }, { "else": {"executor":"interpreter","start":{"mode":"ticks","offset":0}, "limits":{"cpu_share_pct":60,"freq_cap_pct":90,"cooldown_seconds":0}, "reason":"default safe path"} } ] }, "tiebreak": "lexicographic" // if multiple clauses true, pick first (default) } 
+JSON AST operators (v1.0):
+• Comparisons: <, <=, >, >=, ==, != with operands being features or constants names or numbers.
+• Boolean: all (AND), any (OR), not.
+• Arithmetic (limited): add, sub, mul, div, min, max (on numbers).
+• References: a bare string "batt_pct_mean" reads that feature; "min_batt_pct" reads that constant.
+• No user-defined functions; no loops; evaluation is total and order is deterministic (if_chain evaluated top→bottom).
+Determinism rules:
+• Every then/else must produce a Run Configuration within action_space bounds; otherwise SDR_E_ACTION_OOB.
+• If multiple if clauses evaluate true, the first (topmost) wins unless tiebreak states otherwise.
+6) Decision Record (what actually happened)
+File: sched.decision.v1.0.json
+{ "schema": "sched.decision.v1.0", "encoder_id": "…", "ds_registry_id": "…", "decision_id": "…", // §9 hashing "ruleset_id": "…", "inputs": { "pcv_ids": ["…"], // one or more windows used "features": { // materialized feature values (post-quantization) "batt_pct_mean": 78.35, "temp_cpu_max": 58500, "cpu_busy_ratio": 0.2741, "io_w_mb": 6.125 }, "invariants": { "parity_id": "…", "policy_id": "…", "effects_id": "…", "classmap_id": "…", "has_staged": true, "staged_parity_ok": true, "anchor": {"mode":"ticks","current": 180} } }, "evaluation": { // deterministic trace "clauses":[ {"index":0,"result":true}, {"index":1,"result":false} ], "chosen_clause": 0, "tiebreak": "lexicographic" }, "output": { "executor":"staged", "start":{"mode":"ticks","offset":0}, "limits":{"cpu_share_pct":80,"freq_cap_pct":100,"cooldown_seconds":0}, "explain":"cool & charged → staged now" }, "attest": { "pcv_profile_id":"…", // echoes from ruleset.inputs "feature_hash":"blake3:…", // hash of the ordered key/value pairs used "rule_hash":"blake3:…" // hash of the normalized AST } } 
+Rules:
+• features must equal the values in the cited pcv_ids windows (with any arithmetic the ruleset applied explicitly shown if used; v1 encourages rules to read features directly).
+• evaluation.clauses records the boolean result for each clause in order; chosen_clause must correspond to the rule that produced output.
+• output must respect the ruleset’s action_space and eligibility pins (staged_parity_ok etc.).
+• The run’s runtime evidence (outside this SDR object) should show that the engine actually used this configuration. Any discrepancy is reported as non-fatal advisory evidence but must not affect program semantics.
+7) Plan (ordered decisions over a coverage)
+File: sched.plan.v1.0.json
+{ "schema": "sched.plan.v1.0", "encoder_id": "…", "ds_registry_id": "…", "plan_id": "…", // §9 hashing "ruleset_id":"…", "coverage": {"mode":"ticks","start":180,"end":360}, "decisions": ["…","…","…"], // decision_ids in ascending anchor order "notes": "One decision per 60-tick PCV window" } 
+Rules:
+• Decisions must be contiguous/non-overlapping over coverage.
+• Each decision’s inputs.anchor.current must fall into the corresponding PCV window anchor.
+• Plans are evidence-only; engines may plan-ahead or decide per-window.
+8) Interaction with execution
+• The engine gates on decision.output.executor/start at the beginning of the selected window or offset.
+• If start.mode:"seconds", use run-relative seconds, not wall clock.
+• If limits cannot be honored (e.g., OS refuses a freq cap), record a capability note in EP evidence; do not modify program semantics.
+9) Hashing & IDs (DSR-bound)
+• ruleset_id = H( P_sched_rules || canonical(rules_json) ), tag immu.sched.rules.v1.
+• decision_id = H( P_sched_decision || canonical(decision_json) ), tag immu.sched.decision.v1.
+• plan_id = H( P_sched_plan || canonical(plan_json) ), tag immu.sched.plan.v1.
+Preludes are DSR V1; numbers use canonical minimal forms.
+10) Verification (acceptance)
+Given ruleset_id, decision_id (and optional plan_id):
+• Hash checks: all IDs recompute; suites meet Crypto Policy.
+• Purity check (rules): ensure all identifiers in logic refer only to pcv_features or constants; ensure no forbidden inputs (SDR_E_NONPURE).
+• Eligibility: confirm invariant pins (e.g., staged_ok) match decision.inputs.invariants; if not, SDR_E_INELIGIBLE.
+• Feature integrity: load pcv_ids windows; verify decision.inputs.features equals their quantized features; recompute any arithmetic present in logic if used, else ensure direct equality (SDR_E_FEATURE_MISMATCH).
+• Re-evaluate logic deterministically; ensure evaluation.clauses booleans match and chosen_clause reproduces; else SDR_E_TRACE_MISMATCH.
+• Output bounds: ensure output is within action_space and consistent with chosen clause; else SDR_E_ACTION_OOB.
+• Plan coverage (if plan_id): ensure decisions cover coverage non-overlapping and anchors are monotone; else SDR_E_PLAN_HOLE or SDR_E_PLAN_OVERLAP.
+Accept iff all pass.
+11) Deterministic errors (reason names)
+• SDR_E_SCHEMA — unsupported schema (rules/decision/plan).
+• SDR_E_ENCODER — non-canonical bytes.
+• SDR_E_DSR — missing/unknown DSR tag(s).
+• SDR_E_NONPURE — ruleset references forbidden inputs (network/time/RNG/etc.).
+• SDR_E_INPUTS_DECL — decision uses a feature not declared in ruleset inputs.pcv_features.
+• SDR_E_ELIGIBILITY — eligibility pins unmet (e.g., staged_ok=false but executor "staged").
+• SDR_E_FEATURE_MISS — required PCV feature missing from cited windows.
+• SDR_E_FEATURE_MISMATCH — decision features don’t match PCV window values.
+• SDR_E_TRACE_MISMATCH — re-evaluated clause results differ from recorded trace.
+• SDR_E_ACTION_OOB — chosen output outside action_space or invalid type/range.
+• SDR_E_PLAN_HOLE — plan has coverage gaps.
+• SDR_E_PLAN_OVERLAP — plan windows overlap.
+• SDR_E_ANCHOR — start/anchor offsets invalid (negative or outside coverage).
+• SDR_E_HASH — id mismatches after hashing.
+Each failure must include a minimal witness: clause index, offending identifier, expected vs actual value, or the exact bound violated.
+12) Edge cases & corner rules
+• Multiple windows as input: Allowed; the ruleset must state exactly which features from which windows are read (e.g., latest window + previous window deltas). The decision must list all pcv_ids used.
+• No PCV available: Ruleset may permit a fallback path that reads only constants/invariants; still sealed & pure.
+• Executor mismatch at runtime: If the engine falls back from "staged" to "interpreter" due to an unexpected verification failure at launch, record a separate runtime exception evidence; parity must still match, or the run is rejected by existing parity checks.
+• Godot integration: The launcher can pick build graph steps (e.g., pre-warm assets) only if they do not change game-state semantics. Such pre-warm is evidence-only; outputs must not be consumed by the program path unless they are deterministic caches already admitted by Effects (mem.cache).
+• Self-healing interactions: Heals must not be triggered by rules as a side effect. They run under their own certs (Slice 6 note) and may be scheduled by SDR only if their semantics are “no state change” (pre/post root equal).
+13) Golden vectors (minimum set)
+Place under golden/sched/v1.0/:
+• Ruleset-A: Exactly the JSON in §5 → ruleset_id.
+• Decision-Pass-1: PCV window with batt_pct_mean=78.35, temp_cpu_max=58500, cpu_busy_ratio=0.2741 ⇒ clause 0 true, selects "staged" now (ticks), limits (80/100/0) → decision_id.
+• Decision-Pass-2 (defer): PCV window with temp_cpu_max=61200 or batt_pct_mean=22.00 ⇒ clause 1 true, selects "interpreter", start.seconds+120, limits (40/70/120).
+• Trace-mismatch: Same as (2) but mutate evaluation.clauses[1].result to false ⇒ SDR_E_TRACE_MISMATCH.
+• Action-OOB: Return cpu_share_pct=95 when max is 90 ⇒ SDR_E_ACTION_OOB.
+• Nonpure-fail: A rule referencing "wall_clock" ⇒ SDR_E_NONPURE.
+• Plan-coverage: Three decisions covering ticks [180,360) exactly; remove the middle ⇒ SDR_E_PLAN_HOLE.
+Each vector includes canonical bytes hex, DSR preludes, and expected digests.
+14) What this does not change (stability)
+• No changes to Tape, parity, effects, capabilities, policy, or ABI/gas.
+• No reliance on nondeterministic inputs; all inputs are sealed CAS objects or monotone run-relative counters.
+• No schema changes to existing artifacts; SDR lives entirely in EP evidence.
+• Runs remain fully replayable offline without executing the rules again (the Decision Record is enough for audit; recomputation is for verification).
+End of Slice 12.
+Say continue to proceed. Tight next slices that interlock cleanly:
+• Haptics Map v1.0 (deterministic actuator commands as evidence-only outputs),
+• Per-Tick Admission v1.0 (context switches across frames with witnesses), or
+• Heals & Maintenance Cert v1.0 (no-state-change maintenance with Merkle equality proofs).
+Slice 13 — Heals & Maintenance Cert v1.0
+(Fully expanded, single sealed module. Builds on Slices 1–12. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• A normative contract for maintenance-only operations (“heals”) that cannot change program semantics or state.
+• Canonical objects for: Heal Plan, Heal Run, CAS Inventory, and the Heal Certificate proving root equality and unreachable-only touches.
+• Allowed operation classes (pack, reindex, vacuum, verify, re-fetch, quarantine), tool allowlist, hashing, verification, errors, and golden vectors.
+Out-of-scope (deferred):
+• Any op that modifies logical memory or commits a new root; any network-side retention policy; transport mirroring policy.
+• Gas, Effects, Capabilities, Policy, Parity—unchanged.
+Depends on:
+• Transport & Storage Plane (sealed CAS, ca_open, mount/watch).
+• Parity v1.1 (Slice 4) — referenced but not altered.
+• Effects & Capability (Slices 6–7) — referenced for invariants, not altered.
+• Crypto Policy & DSR (Slice 10 & 3) — hashing and multihash attestations.
+• EP (Slice 9) — evidence layout; build & diagram fingerprints.
+Stability note: Heals are semantics-inert: pre_root == post_root, reachable object set unchanged byte-for-byte. Any other outcome is a violation.
+1) Purpose (one paragraph)
+Heals keep the store lean and verifiable (pack/GC/reindex/repair) without changing the committed state or proofs. This slice defines how to declare a maintenance plan, run it under a pinned tool allowlist, and prove—with a Heal Certificate—that only unreachable CAS objects were touched and that the Merkle root (and reachable-object hashes) remained identical.
+2) DSR tags (append-only)
+• immu.heal.plan.v1 — Heal Plan (intent & scope).
+• immu.heal.run.v1 — Heal Run (execution transcript & touches).
+• immu.heal.inventory.v1 — CAS Inventory snapshot (reachable/unreachable sets).
+• immu.heal.cert.v1 — Heal Certificate (verifier-facing).
+Publishing this slice implies a new ds_registry_id that includes these tags.
+3) Allowed operations (normative classes)
+Heals may use only these classes, operating on CAS layout and indexes—never on logical memory:
+• Verify — re-hash objects, re-check zero-table, re-scan manifests.
+• Pack — rewrite CAS filesystem layout (e.g., fanout rebucket, dedup hardlinks) without changing object bytes.
+• Reindex — rebuild side indexes (bloom filters, path caches, HAMT fanout tables, file lists).
+• Vacuum/GC — delete unreachable objects only (post proof).
+• Re-fetch — re-download an object by digest from a read-only remote and verify on touch (ca_open).
+• Quarantine — move suspected bad unreachable objects to a quarantine area outside CAS (content-address persists in record).
+• Timestamp scrub — normalize mtime/ctime/owner on unreachable objects or index files (evidence-only).
+Forbidden: rewriting bytes of any reachable CAS object; creating new reachable objects; touching logical snapshots; modifying manifests that alter reachability. Any such attempt ⇒ reject.
+4) CAS Inventory (heal.inventory.v1.0)
+A sealed snapshot of what is reachable vs not, by hash and size.
+{ "schema": "heal.inventory.v1.0", "encoder_id": "…", "ds_registry_id": "…", "inventory_id": "…", // §9 hashing "root": "sha256:…", // Merkle state root this inventory is grounded to "reach": { "objects": ["blake3:…","blake3:…", "..."], // sorted unique list (primary suite per policy) "count": 12345, "bytes": 987654321 }, "unreach": { "objects": ["blake3:…", "..."], // optional sampling or full list "count": 54321, "bytes": 123456789 }, "digests": { "reach_set": "blake3:…", // H(sorted ids) "unreach_set": "blake3:…" }, "source": { "snapshots": ["…","…"], // snapshot labels/ids used as roots "cas_root": "~/.immutable-store/blobs/…", "scan_params": {"fanout":"aa/","threads":4} } } 
+Rules
+• reach.objects must contain all CAS objects reachable from the given root (Merkle closure).
+• unreach may be full or partial; GC must never assume that a missing id is reachable—only reach_set is authoritative.
+• The inventory is computed twice (before & after) in a heal to prove no reachable change.
+5) Heal Plan (heal.plan.v1.0)
+Declares intent, tools, and scope before execution.
+{ "schema": "heal.plan.v1.0", "encoder_id": "…", "ds_registry_id": "…", "plan_id": "…", // §9 hashing "pre_inventory_id": "…", // inventory before heal "targets": { "cas_root": "~/.immutable-store/blobs", "indexes": ["~/.immutable-store/index/bloom","…"] }, "ops": [ // sequence; pure intent {"kind":"verify", "args":{"zero_table":"abi/zero-table.json","threads":4}}, {"kind":"reindex", "args":{"bloom_bits":12,"fanout":"aa/"}}, {"kind":"pack", "args":{"hardlink_dedup":true,"rebucket":"aa/"}}, {"kind":"gc", "args":{"keep":"reach_set","dry_run":false}}, {"kind":"scrub", "args":{"normalize_ts":true}} ], "tool_allowlist": [ {"bin":"sha256sum","version":"8.32"}, {"bin":"b3sum","version":"1.5.0"}, {"bin":"immu","version":"1.0.0"}, {"bin":"rclone","version":"1.67.0"}, {"bin":"inotifywait","version":"3.22.6"}, {"bin":"busybox","version":"1.36.1"} ], "env_lock": { "LANG":"C","TZ":"UTC","LC_ALL":"C", "SOURCE_DATE_EPOCH": "1731024000" // pinned environment cordon }, "notes":"Pack + reindex + GC unreachable only; no reachable touch" } 
+Rules
+• ops is declarative; any deviation at run-time must be recorded in the Heal Run (and will likely fail verification).
+• tool_allowlist + env_lock must be enforced by the runner; mismatches ⇒ HEAL_E_TOOL_ENV.
+6) Heal Run (heal.run.v1.0)
+The executed transcript: touches, deviations, after-inventory.
+{ "schema": "heal.run.v1.0", "encoder_id": "…", "ds_registry_id": "…", "run_id": "…", // §9 hashing "plan_id":"…", "pre_inventory_id":"…", "post_inventory_id":"…", "pre_root":"sha256:…", "post_root":"sha256:…", "start_mono_s": 1000, // run-relative seconds (not wall clock) "duration_s": 37, "tools": { "fingerprints":[ {"bin":"sha256sum","version":"8.32","hash":"blake3:…"}, {"bin":"b3sum","version":"1.5.0","hash":"blake3:…"} ], "allowlist_checked": true }, "env": {"LANG":"C","TZ":"UTC","LC_ALL":"C","SOURCE_DATE_EPOCH":"1731024000"}, "touches": { // *unreachable-only* writes expected "writes":[ {"id":"blake3:…","bytes":4096,"class":"index"}, {"id":"blake3:…","bytes":0,"class":"metadata"} ], "deletes":[ {"id":"blake3:…","bytes":65536,"class":"unreach"} ], "moves":[ {"id":"blake3:…","from":"…/ab/cd…","to":"…/ef/01…"} ], "reads":[ {"id":"blake3:…","bytes":1048576} ] }, "digests": { "writes_set":"blake3:…", // H(sorted ids) "deletes_set":"blake3:…" }, "deviations":[ // if any {"op":"pack","reason":"rebucket fallback","detail":"fanout unchanged"} ], "quarantine":[ {"id":"blake3:…","reason":"hash mismatch on verify"} ] } 
+Rules
+• pre_root and post_root must be identical; any change ⇒ fail.
+• post_inventory.reach_set must equal pre_inventory.reach_set.
+• touches.writes|deletes|moves must not contain any id in reach.objects; if they do ⇒ HEAL_E_REACH_TOUCHED.
+• quarantine entries must appear only for ids not in reach.objects.
+7) Heal Certificate (heal.cert.v1.0)
+Verifier-facing summary proving semantics invariance and unreachable-only touches.
+{ "schema":"heal.cert.v1.0", "encoder_id":"…", "ds_registry_id":"…", "cert_id":"…", // §9 hashing "plan_id":"…", "run_id":"…", "pre_inventory_id":"…", "post_inventory_id":"…", "assert": { "root_equal": true, "reachable_equal": true, "unreachable_only_touched": true }, "witness": { "pre_root":"sha256:…", "post_root":"sha256:…", "reach_set_pre":"blake3:…", "reach_set_post":"blake3:…", "writes_set":"blake3:…", "deletes_set":"blake3:…" }, "tool_env_checked": true, "notes":"Vacuum deleted 12,431 unreachable objects; packed indices" } 
+Rules
+• The certificate recomputes all referenced hashes; if any mismatch, verification fails.
+• assert.* values are computed by the cert builder; a verifier must recompute independently.
+8) Determinism & Guardrails
+• No logical writes: Heals operate outside the logical memory/merkle planes. A heal that produces any write_set_digest change or state diff is invalid.
+• Allowlist-only tools: Only binaries listed in tool_allowlist may be invoked; versions and hashes must match.
+• Environment cordon: LANG/TZ/LC_ALL/SOURCE_DATE_EPOCH pinned; deviation ⇒ HEAL_E_TOOL_ENV.
+• Monotone time: Use run-relative monotone seconds for durations; wall-time logging is optional evidence-only.
+9) Hashing & IDs (DSR-bound)
+• inventory_id = H( P_heal_inventory || canonical(inventory_json) ), tag immu.heal.inventory.v1.
+• plan_id = H( P_heal_plan || canonical(plan_json) ), tag immu.heal.plan.v1.
+• run_id = H( P_heal_run || canonical(run_json) ), tag immu.heal.run.v1.
+• cert_id = H( P_heal_cert || canonical(cert_json) ), tag immu.heal.cert.v1.
+Preludes are DSR V1; multihash attestations per Crypto Policy (Slice 10) are recommended for inventories & certs.
+10) Verifier procedure (acceptance)
+Given plan_id, run_id, cert_id:
+• Hash checks: plan/run/inventories/cert recompute; suites satisfy Crypto Policy.
+• Tool/env: tool_allowlist and env_lock from the Plan must match the Run’s tools & env. Else HEAL_E_TOOL_ENV.
+• Root equality: pre_root == post_root. Else HEAL_E_ROOT_CHANGE.
+• Reachable equality: Load inventories; require reach_set_pre == reach_set_post. Else HEAL_E_REACH_SET.
+• Touch classification: For every id in touches.writes|deletes|moves, ensure it is not in reach.objects. Else HEAL_E_REACH_TOUCHED.
+• GC correctness: For each deletes.id, ensure it is not in post_inventory.unreach.objects (if full list available) and not in reach.objects.
+• Quarantine rule: For each quarantine.id, ensure not in reach; optional verify mismatch evidence; else HEAL_E_QUARANTINE_REACH.
+• Plan adherence: Ensure executed ops match Plan order/classes (args may downshift, not upscale). Else HEAL_E_PLAN_DEVIATE.
+Accept iff all pass; otherwise reject with a minimal witness.
+11) Deterministic errors (reason names)
+• HEAL_E_SCHEMA — unsupported schema for plan/run/inventory/cert.
+• HEAL_E_ENCODER — non-canonical encoding.
+• HEAL_E_DSR — missing/unknown DSR tag(s).
+• HEAL_E_TOOL_ENV — tool not in allowlist, wrong version/hash, or env lock mismatch.
+• HEAL_E_ROOT_CHANGE — pre_root != post_root.
+• HEAL_E_REACH_SET — reachable set digest changed.
+• HEAL_E_REACH_TOUCHED — a reachable object was written/moved/deleted.
+• HEAL_E_PLAN_DEVIATE — run deviates from plan op sequence or class.
+• HEAL_E_QUARANTINE_REACH — quarantined id is reachable.
+• HEAL_E_INV_INCOMPLETE — inventory missing reach_set or inconsistent counts.
+• HEAL_E_HASH — id mismatch after hashing.
+12) Golden vectors (minimum set)
+Place under golden/heal/v1.0/:
+• Inventory-A-pre: Reachable set for root=R with reach_set=H1, sample unreach → inventory_id_pre.
+• Plan-A: Verify→Reindex→Pack→GC→Scrub with allowlist/env lock → plan_id.
+• Run-A: Touches write only indexes, delete 12,431 unreachable ids, move some unreachable paths, quarantines 2 suspicious unreachable; pre_root==post_root; post_inventory.reach_set == H1 → run_id.
+• Cert-A: Binds (2)&(3), asserts equality & unreachable-only → cert_id.
+• Fail-Root-Change: Same as Run-A but post_root ≠ pre_root → expect HEAL_E_ROOT_CHANGE.
+• Fail-Reach-Touched: Same as Run-A but a reachable id appears in writes → expect HEAL_E_REACH_TOUCHED.
+• Fail-Tool-Env: Allowlist mismatch (sha of b3sum differs) → HEAL_E_TOOL_ENV.
+Each vector includes canonical bytes hex, DSR preludes, and expected digests.
+13) Interaction with other planes
+• Effects/Capability/Policy: Unchanged. Heals never affect Effect Table budgets, Class Map, or OML admission.
+• Parity: Not included in parity tuple; certs live in EP evidence. If a heal were to change parity (it must not), existing parity checks would fail independently.
+• Transport: ca_open and remote verify-on-touch are standard tools; their transcripts may be referenced in Run evidence.
+• Scheduling (SDR): Heals may be scheduled by SDR as maintenance tasks only if they produce a valid heal certificate (pre/post root equal). SDR evidence must reference the heal cert_id.
+14) What this does not change (stability)
+• No change to state transition, gas model, write-set digest, or parity composition.
+• No new executors or opcodes; only storage/index housekeeping is allowed.
+• No network dependence for verification; all proofs stand offline from the EP.
+End of Slice 13.
+Say continue to proceed. Tight next slices that interlock cleanly:
+• Haptics Map v1.0 (deterministic actuator commands as evidence-only outputs),
+• Per-Tick Admission v1.0 (context switches across frames with witnesses), or
+• Godot Deterministic Asset Pipeline v1.0 (content-addressed import/build rules mirroring your stack).
+
+Slice 14 — Godot Deterministic Asset Pipeline (GDAP) v1.0
+(Fully expanded, single sealed module. Builds on Slices 1–13. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• A sealed, content-addressed asset import pipeline for Godot-family projects that yields bit-identical import outputs across hosts.
+• Canonical Source Package, Import Profile, Import Map, Build Graph, Cache Manifest, Build Run, and a GDAP Certificate.
+• Rules that eliminate ambient nondeterminism (locales, timestamps, randomness, platform drift), plus hashing, verification, deterministic errors, and golden vectors.
+Out-of-scope (deferred): Export packaging/signing (lives with Upgrade/EP); runtime scene semantics; editor UX. No web fetchers here.
+Depends on:
+• DSR v1.0 (Slice 3) — we add tags below.
+• Effects v1.0 (Slice 6) — caches are declared under mem.cache.
+• Capabilities v1.0 (Slice 7) — cache regions are write-admitted by class.
+• Parity v1.1 (Slice 4) — unchanged; GDAP is evidence-only unless import artifacts are explicitly committed.
+• Crypto Policy v1.0 (Slice 10) — multihash attestations.
+• PCV/SDR/Heals (Slices 11–13) — optional; GDAP can be scheduled and healed like other caches.
+Stability note: This slice does not change program semantics. It standardizes import artifacts so the same sources + profile → identical imports, everywhere.
+1) Purpose (one paragraph)
+Godot imports (textures, meshes, audio, fonts, scenes) often vary by platform, toolchain build, and environment settings. GDAP fixes the inputs, settings, and graph so that import outputs are content-addressed and reproducible. The result: caches you can pre-build, deduplicate, verify offline, and share without trust—perfect for a “Forest of Light” stack.
+2) DSR tags (append-only)
+• immu.gdap.src.v1 — GDAP Source Package (canonical tar of raw sources).
+• immu.gdap.profile.v1 — Import Profile (per-type deterministic knobs).
+• immu.gdap.map.v1 — Import Map (source→type/profile mapping & overrides).
+• immu.gdap.graph.v1 — Build Graph (DAG of import tasks).
+• immu.gdap.cache.v1 — Cache Manifest (source digests → import artifacts).
+• immu.gdap.run.v1 — Build Run (transcript & toolchain fingerprints).
+• immu.gdap.cert.v1 — GDAP Certificate (verifier-facing attestation).
+Publishing this slice implies a new ds_registry_id including all tags above.
+3) Canonical Source Package (gdap.src.v1.0)
+A platform-neutral tarball of project raw assets.
+{ "schema":"gdap.src.v1.0", "encoder_id":"…", "ds_registry_id":"…", "src_id":"…", // §10 hashing "root_dir":"project/", // logical root inside tar "rules":{ "path_encoding":"utf8-nfc", "paths_sorted":true, "newline":"lf", // \n only "perm_mode":"0644/0755", // files/execs normalized "uid_gid":"0:0", "mtime":"SOURCE_DATE_EPOCH", // single timestamp for all entries "xattrs":"strip" }, "filters":{ "ignore":["**/.git/**","**/.DS_Store","**/Thumbs.db"] }, "counts":{"files":1234,"bytes":987654321} } 
+Rules (normative):
+• Tar format: ustar/PAX with all mtimes = SOURCE_DATE_EPOCH (carried in EP env lock).
+• Path normalization: UTF-8 NFC, / separators, no absolute or ...
+• Text files normalized to LF. Binary untouched.
+• This object’s bytes are what importers read. Any host path mapping is evidence-only.
+4) Import Profile (gdap.profile.v1.0)
+Deterministic settings per asset type. Values mirror Godot import knobs but are frozen here.
+{ "schema":"gdap.profile.v1.0", "encoder_id":"…", "ds_registry_id":"…", "profile_id":"…", "godot_fingerprint":{ "flavor":"headless|editor", "engine_ver":"4.x.y-custom", "module_hash":"blake3:…", // hash of engine modules list "importers_hash":"blake3:…" // hash of importer registry dump }, "defaults":{ "random_seed":0, // forbid RNG drift "locale":"C","tz":"UTC", "threads":1, // deterministic single-thread import "platform":"deterministic" // no per-platform toggles }, "types":{ "texture":{ "format":"png|webp|basisu", "lossless":true, // if false, quantized quality below "quality_q":null, // integer if lossy; null if lossless "srgb":true, "mipmaps":true, "normal_map":false, "repeat":"disabled|enabled|mirrored", "filter":"nearest|bilinear|trilinear", "anisotropy":0, // 0..16 "atlas":false // no auto-atlas to avoid nondeterminism }, "mesh":{ "optimize":"deterministic", // fixed pass set/order "tangents":"mikktspace", "weld_threshold":0.0, // disable float fuzz "quantize":{"pos":16,"uv":16,"norm":8}, // if using meshopt-like quant "recalc_normals":false, "center_mesh":false }, "audio":{ "format":"wav|ogg|mp3", "resample":"sinc_fast|sinc_best", // fixed algorithm "rate":48000, "channels":"source" // no auto-mix unless specified }, "font":{ "subpixel":"none|rgb|bgr", "hinting":"none|light|full", "oversampling":1.0 }, "scene":{ "strip_editor_only":true, "deterministic_ids":true, // stable node/resource IDs "animation_import":"bake_fixed", // fixed timestep bake "bake_dt_ms":16.6667 }, "shader":{ "opt_level":"O0", // avoid backend-dependent reorderings "defines":{} // stable ordering by sorted key } } } 
+Rules:
+• Threads=1 for imports; parallelism can be introduced with per-file process isolation if each file is single-thread imported.
+• If texture.lossless=false, quality_q must be set and its encoder must be a deterministic build; otherwise GDAP_E_TEXTURE_LOSSY.
+• Any setting not listed is default-forbidden; import runners must not consult host configs.
+5) Import Map (gdap.map.v1.0)
+Binds source paths (inside src_id) to types, optional per-file overrides, and expected outputs.
+{ "schema":"gdap.map.v1.0", "encoder_id":"…", "ds_registry_id":"…", "map_id":"…", "src_id":"…", "profile_id":"…", "entries":[ { "path":"project/assets/tex/ui/logo.svg", "type":"texture", "overrides":{"format":"png","srgb":true,"mipmaps":false}, "expects":[ {"kind":"import","ext":".import/.res","role":"meta"}, {"kind":"artifact","ext":".png","role":"texture"} ] }, { "path":"project/assets/mesh/crate.fbx", "type":"mesh", "overrides":{"quantize":{"pos":12,"uv":12,"norm":8}}, "expects":[ {"kind":"artifact","ext":".mesh","role":"mesh"} ] } ] } 
+Rules:
+• overrides must be a subset of the profile type keys; unknown keys ⇒ GDAP_E_OVERRIDE.
+• expects[*].ext enumerate exact artifacts that must be produced.
+• Map covers all files to be imported; unmatched files are ignored or explicitly listed with type:"ignore".
+6) Build Graph (gdap.graph.v1.0)
+A deterministic DAG of import tasks.
+{ "schema":"gdap.graph.v1.0", "encoder_id":"…", "ds_registry_id":"…", "graph_id":"…", "src_id":"…","map_id":"…","profile_id":"…", "nodes":[ {"id":"n1","kind":"import","path":"project/assets/tex/ui/logo.svg", "deps":[]}, {"id":"n2","kind":"import","path":"project/assets/mesh/crate.fbx", "deps":[]} ], "order":"toposort_lex" // tie-break by (kind,path) lexicographic } 
+Rules:
+• Node identity = H(kind||path||profile_id||map_overrides_subtree).
+• Order is normative; runners must process in order.
+• No network/download nodes allowed; all inputs must be inside src_id.
+7) Cache Manifest (gdap.cache.v1.0)
+Records the mapping from source digests to artifact digests.
+{ "schema":"gdap.cache.v1.0", "encoder_id":"…", "ds_registry_id":"…", "cache_id":"…", "src_id":"…","map_id":"…","profile_id":"…","graph_id":"…", "entries":[ { "path":"project/assets/tex/ui/logo.svg", "src_digest":"blake3:…", // digest of source bytes in src tar "artifacts":[ {"role":"meta", "name":"logo.svg.import","digest":"blake3:…","bytes":512}, {"role":"texture", "name":"logo.png", "digest":"blake3:…","bytes":4096} ] } ], "digests":{ "entry_set":"blake3:…" // H(sorted (path||src_digest||art_digests…)) } } 
+Rules:
+• Artifacts are bytestream-equal across hosts.
+• Names are deterministic functions of path plus fixed suffixes (no random GUIDs).
+• The cache is content-addressed; duplicate sources dedupe to one artifact set.
+8) Build Run (gdap.run.v1.0)
+What actually executed.
+{ "schema":"gdap.run.v1.0", "encoder_id":"…", "ds_registry_id":"…", "run_id":"…", "src_id":"…","map_id":"…","profile_id":"…","graph_id":"…", "cache_id":"…", "toolchain":{ "godot":{"path":"…/godot-headless","ver":"4.x.y","sha":"blake3:…"}, "importers_hash":"blake3:…", "plugins":[], // must be empty or hashed deterministically "env":{"LANG":"C","TZ":"UTC","LC_ALL":"C","SOURCE_DATE_EPOCH":"1731024000"} }, "exec":{ "threads":1,"sandbox":"no-net,no-gpu", "order":"toposort_lex" }, "nodes":[ {"id":"n1","status":"ok","artifacts":[{"name":"logo.png","digest":"blake3:…"}]}, {"id":"n2","status":"ok","artifacts":[{"name":"crate.mesh","digest":"blake3:…"}]} ], "dur_s": 3.14 } 
+Rules:
+• No plugins unless they are sealed and hashed in plugins (then they must be included in godot_fingerprint and importers_hash).
+• sandbox forbids network; GPU acceleration disabled to avoid driver nondeterminism.
+• Any node status ≠ ok ⇒ run fails.
+9) GDAP Certificate (gdap.cert.v1.0)
+Verifier-facing attestation.
+{ "schema":"gdap.cert.v1.0", "encoder_id":"…", "ds_registry_id":"…", "cert_id":"…", "src_id":"…","map_id":"…","profile_id":"…","graph_id":"…","cache_id":"…","run_id":"…", "assert":{ "all_paths_covered":true, "artifacts_match_cache":true, "toolchain_frozen":true, "no_platform_drift":true }, "witness":{ "entry_set":"blake3:…", "importers_hash":"blake3:…", "engine_ver":"4.x.y" } } 
+Rules:
+• Verifier recomputes entry_set from cache.entries and cross-checks run.nodes[*].artifacts digests.
+• Platform drift test: ensure profile.defaults.platform:"deterministic" and no per-platform toggles present.
+10) Hashing & IDs (DSR-bound)
+• src_id = H( P_gdap_src || canonical(src_json) ), tag immu.gdap.src.v1.
+• profile_id = H( P_gdap_profile || canonical(profile_json) ), tag immu.gdap.profile.v1.
+• map_id = H( P_gdap_map || canonical(map_json) ), tag immu.gdap.map.v1.
+• graph_id = H( P_gdap_graph || canonical(graph_json) ), tag immu.gdap.graph.v1.
+• cache_id = H( P_gdap_cache || canonical(cache_json) ), tag immu.gdap.cache.v1.
+• run_id = H( P_gdap_run || canonical(run_json) ), tag immu.gdap.run.v1.
+• cert_id = H( P_gdap_cert || canonical(cert_json) ), tag immu.gdap.cert.v1.
+All bytes are canonical per encoder_id. Multihash attestations satisfy Crypto Policy §3.
+11) Verification (acceptance)
+Given src_id, profile_id, map_id, graph_id, cache_id, run_id, cert_id:
+• Hash checks for all objects; suites meet Crypto Policy.
+• Source canonicality: Recreate the normalized tar and verify src_id.
+• Profile sanity: Ensure defaults/types are recognized; threads==1; forbidden fields absent; lossy knobs valid.
+• Map coverage: Every map entry path exists in the source tar; overrides ⊆ profile.types[type].
+• Graph totality: Nodes cover all non-ignored map entries exactly once; order is toposort_lex.
+• Re-import spot checks: Option A (strict) — re-run import in hermetic mode and reproduce cache.artifacts digests; Option B (cached) — recompute deterministic post-processing where feasible (e.g., basisu lossless) and verify digests.
+• Run/toolchain: Verify toolchain.env equals cordon; plugins empty or hashed & reflected in godot_fingerprint; sandbox flags correct.
+• Cert assertions: entry_set matches; no_platform_drift passes; artifacts_match_cache passes.
+Accept iff all pass; otherwise reject with deterministic errors (§12).
+12) Deterministic errors (reason names)
+• GDAP_E_SCHEMA — unsupported schema (src/profile/map/graph/cache/run/cert).
+• GDAP_E_ENCODER — non-canonical bytes.
+• GDAP_E_DSR — unknown/missing DSR tag.
+• GDAP_E_SRC_PATH — illegal path (non-UTF8, absolute, ..).
+• GDAP_E_SRC_MTIME — tar entry mtime ≠ SOURCE_DATE_EPOCH.
+• GDAP_E_PROFILE_FORBID — profile includes a setting not allowed in v1.0.
+• GDAP_E_TEXTURE_LOSSY — lossy texture with unspecified or non-deterministic quality/encoder.
+• GDAP_E_OVERRIDE — map override not in the profile for that type.
+• GDAP_E_MAP_MISS — map references missing source file.
+• GDAP_E_GRAPH_ORDER — graph order not toposort_lex or deps inconsistent.
+• GDAP_E_TOOLCHAIN — engine/plugins/importers hash mismatch or plugins unpinned.
+• GDAP_E_ENV — env cordon violated (LANG/TZ/LC_ALL/SDE).
+• GDAP_E_ARTIFACT — produced artifact name/digest missing or mismatched.
+• GDAP_E_PLATFORM_DRIFT — per-platform toggles observed while platform:"deterministic".
+• GDAP_E_CACHE_SET — recomputed entry_set mismatch.
+• GDAP_E_HASH — id mismatch after hashing.
+Each failure returns a minimal witness (path, setting, digest pair, or entry index).
+13) Golden vectors (minimum set)
+Place under golden/gdap/v1.0/:
+• Src-A: Canonical tar with logo.svg, crate.fbx, normalized mtimes/permissions → src_id.
+• Profile-A: Deterministic profile (lossless PNG, mikktspace, O0 shaders) → profile_id.
+• Map-A: Entries for logo.svg (texture; png, no mip) and crate.fbx (mesh; quant 12/12/8) → map_id.
+• Graph-A: Two independent nodes, order toposort_lex → graph_id.
+• Cache-A: Expected artifact digests for the two files (provided as hex) → cache_id.
+• Run-A: Toolchain fingerprints & node status=ok; env cordon set → run_id.
+• Cert-A: Binds all above; entry_set matches → cert_id.
+• Fail-Lossy: Same as (2) but texture.lossless=false and quality_q unset → GDAP_E_TEXTURE_LOSSY.
+• Fail-Env: Change TZ to America/New_York → GDAP_E_ENV.
+• Fail-Artifact: Flip one byte of logo.png digest → GDAP_E_ARTIFACT.
+Each vector includes canonical bytes hex, DSR preludes, and expected digests.
+14) Interaction with other planes
+• Effects/Capabilities: Import writes target regions labeled mem.cache; Effect Table must include mem.write.mem.cache with a bounded max_total_len.
+• Policy/Admission: A policy context can allow eff.mem.write.mem.cache atoms; no semantic writes are permitted here.
+• PCV/SDR: You can schedule imports (pre-warm) based on battery/thermal PCV; record SDR decisions.
+• Heals: GDAP caches can be vacuumed/repacked by Heals; cert ensures no reachable state changes.
+• Transport/Storage: All artifacts are CAS blobs; remote verify-on-touch via ca_open is allowed.
+15) What this does not change (stability)
+• No change to your interpreter/staged semantics, parity tuple, gas model, or policy lattice.
+• No network or host clock dependency; everything is sealed and reproducible offline.
+• No per-platform or driver-dependent toggles; imports are platform-neutral under this profile.
+End of Slice 14.
+Say continue to proceed. Natural next slices that dovetail:
+• Haptics Map v1.0 (deterministic actuator commands as evidence-only),
+• Per-Tick Admission v1.0 (policy contexts that change across frames), or
+• Export Bundle Cert v1.0 (sealed, reproducible Godot export with multihash attestations).
+Slice 15 — Haptics Map v1.0 (Deterministic Actuator Outputs)
+(Fully expanded, single sealed module. Builds on Slices 1–14. Evidence-only; no semantic effect. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• Canonical Haptics Map that translates engine/runtime “rumble/trigger” intents into device-agnostic logical actuators.
+• Canonical Haptic Pattern object: a time-quantized, piecewise-constant envelope per actuator.
+• Play Record: what was attempted & honored on a pad/device, with device capability evidence.
+• Haptics Certificate: verifier-facing binding from intents → patterns → play records.
+• Codesets, quantization, hashing, verification, errors, golden vectors.
+Out-of-scope (deferred):
+• Changing program semantics, parity, effects, capability lattice.
+• Haptic feedback sensors (closed loop). v1.0 is open-loop output only.
+• Audio-driven haptics; network-fed haptics.
+Depends on:
+• DSR v1.0 (Slice 3) — new tags below.
+• Gamepad Map v1.0 (Slice 9) — pad indices & device fingerprints.
+• Crypto Policy v1.0 (Slice 10) — multihash attestations.
+• Tape v1.0 (Slice 1) — optional tick anchor; tape schema unchanged.
+• PCV/SDR (Slices 11–12) — may schedule/defuse haptics via rules; evidence only.
+• GDAP (Slice 14) — unrelated; just shares build/env cordon ideas.
+Stability note: Haptics are not inputs; they do not enter parity. All artifacts are sealed evidence.
+1) Purpose (one paragraph)
+Different controllers expose different actuators (low/high-frequency rumble, left/right motors, adaptive triggers) and vendor APIs. To reproduce runs offline, we standardize: (1) logical actuator names, (2) quantization of amplitude/time, (3) a sealed pattern format, and (4) a sealed play record that shows what was attempted and what the device claims to have honored. Verifiers then re-derive identical patterns from intents and confirm the play record matches—without touching program semantics.
+2) DSR tags (append-only)
+• immu.haptics.map.v1 — Haptics Map (logical actuators & device binding).
+• immu.haptics.cap.v1 — Device Capability Report (declared actuator capabilities).
+• immu.haptics.pattern.v1 — Haptic Pattern (quantized envelope per actuator).
+• immu.haptics.play.v1 — Haptics Play Record (attempted vs honored).
+• immu.haptics.cert.v1 — Haptics Certificate (binding & verification summary).
+Publishing this slice implies a new ds_registry_id including these tags.
+3) Logical actuator codesets (normative)
+3.1 Logical actuators (codeset.actuators)
+• Rumble motors: rumble_low_left, rumble_low_right, rumble_high_left, rumble_high_right
+(If device has only 2 motors, map to rumble_low_left/right; rumble_high_* absent.)
+• Triggers (analog resistance/rumble): trigger_l_resist, trigger_r_resist, trigger_l_rumble, trigger_r_rumble
+• Global fallback: rumble_global (devices with one actuator)
+Append-only list, lowercase snake_case. Each actuator is independent.
+3.2 Time & amplitude grid (normative defaults)
+• Time quantum dt_ms = 5 (200 Hz grid).
+• Amplitude domain A ∈ [0,1] and quantization: 
+• Rumble amplitudes: uint8 → 0..255.
+• Trigger resistance: uint8 → 0..255 (monotone resistance scale).
+• Duration = integer multiples of dt_ms.
+• Envelopes are piecewise-constant steps on this grid.
+4) Haptics Map (haptics.map.v1.0)
+{ "schema":"haptics.map.v1.0", "encoder_id":"…", "ds_registry_id":"…", "hmap_id":"…", // §9 hashing "pad_profile":"xinput|dualshock4|dualsense|switch_pro|generic", "device_fingerprint":{"vendor":"0x045e","product":"0x0b12","name":"Example"}, "actuators":[ "rumble_low_left", "rumble_low_right" ], "quantization":{ "dt_ms":5, "amp_bits":{"rumble":8,"trigger":8}, "default_ramp_ms":0 // ramps are explicit; default 0 }, "mapping":{ "global_rumble→rumble_low": true, // intents may say "global" "dual_motor_balance":"equal|weighted", // how global splits into L/R "trigger_resist_model":"linear" // v1 only }, "padset_id":"…", // optional (Slice 9) "notes":"Two-motor rumble device; no high-frequency channel" } 
+Rules:
+• actuators list the available logical actuators on this device/profile. Missing ones are unsupported.
+• If global_rumble→rumble_low=true, any rumble_global intent is split across rumble_low_left/right per dual_motor_balance.
+• For devices with 4 motors (low/high each side), both low/high appear.
+• For devices with adaptive triggers, include trigger_* actuators and quantization.
+5) Device Capability Report (haptics.cap.v1.0)
+What the OS/driver reports (evidence only; used to sanity-check the map).
+{ "schema":"haptics.cap.v1.0", "encoder_id":"…", "ds_registry_id":"…", "hcap_id":"…", "source_api":"xinput|hid|android|linux.evdev|web.haptics", "caps":{ "motors": {"count":2,"kinds":["low","low"],"max_amp":255}, "triggers": {"l":{"resist":true,"rumble":false},"r":{"resist":false,"rumble":false}}, "rate_hz":200, "min_pulse_ms":5 }, "device_fingerprint":{"vendor":"0x045e","product":"0x0b12","path":"/dev/input/js0"} } 
+Rule: Verifiers compare caps against hmap.actuators & quantization. Divergence ⇒ HAPT_E_CAP_MISMATCH (warn or fail per policy).
+6) Haptic Pattern (haptics.pattern.v1.0)
+A sealed, deterministic envelope per actuator on the 5 ms grid.
+{ "schema":"haptics.pattern.v1.0", "encoder_id":"…", "ds_registry_id":"…", "pattern_id":"…", "hmap_id":"…", "anchor":{"mode":"ticks|seconds","start":240}, // run-relative anchor "dt_ms":5, "tracks":[ {"actuator":"rumble_low_left", "steps":[ {"amp":128,"dur_ms":100}, {"amp":0,"dur_ms":50} ]}, {"actuator":"rumble_low_right", "steps":[ {"amp":128,"dur_ms":100}, {"amp":0,"dur_ms":50} ]} ], "length_ms":150, "notes":"Canonicalized from intent: rumble_global amp=0.5 for 100ms" } 
+Rules:
+• amp is integer 0..255; dur_ms is multiple of dt_ms.
+• Tracks must reference actuators present in hmap.
+• length_ms must equal the sum of dur_ms for all tracks; shorter tracks are implicitly zero-padded to length_ms.
+• Patterns are built by canonicalization: 
+• Resolve intent (global/side/band) to per-actuator target amplitudes.
+• Clamp to device caps.
+• Snap durations to dt_ms.
+• Merge adjacent equal-amp steps.
+7) Intents → Patterns (normative conversion)
+Intent schema (engine-facing, not DSR-sealed):
+HapticIntent { kind: "rumble" | "trigger_resist", target: "global" | "left" | "right" | "low" | "high" | "trigger_l" | "trigger_r", amp: 0.0..1.0 (float), dur_ms: integer, ramp_ms: optional integer (default 0), balance: optional 0.0..1.0 (split for global; default 0.5) } 
+Canonicalization algorithm (pure):
+• Normalize target using hmap.mapping to concrete actuators.
+• Quantize amplitude: amp_q = round(amp * (2^amp_bits - 1)).
+• Snap times: d_q = ceil(dur_ms / dt_ms)*dt_ms, r_q = ceil(ramp_ms / dt_ms)*dt_ms.
+• Ramps (if r_q>0): split into r_q/dt_ms equal steps; otherwise one step.
+• Split global across left/right by balance (quantize individually).
+• Clip to device caps.max_amp if declared.
+• Merge adjacent same-amp steps.
+• Sort tracks lexicographically by actuator.
+Multiple intents in a tick produce concatenated or overlaid patterns:
+• Overlay rule: if overlapping in time for the same actuator, max(amp) wins (idempotent); durations follow the max schedule.
+• Concatenate rule: intents with non-overlapping anchors are concatenated.
+Use overlay by default when anchors coincide; otherwise concatenate.
+8) Play Record (haptics.play.v1.0)
+What the runtime attempted vs what the device claims it honored.
+{ "schema":"haptics.play.v1.0", "encoder_id":"…", "ds_registry_id":"…", "play_id":"…", "pattern_id":"…", "hmap_id":"…", "hcap_id":"…", "pad":0, "attempt":{ "start_at":{"mode":"ticks","offset":0}, "tracks":[ {"actuator":"rumble_low_left","steps":[{"amp":128,"dur_ms":100},{"amp":0,"dur_ms":50}]}, {"actuator":"rumble_low_right","steps":[{"amp":128,"dur_ms":100},{"amp":0,"dur_ms":50}]} ] }, "honored":{ "result":"ok|clipped|downgraded|no_device|muted_by_os", "tracks":[ {"actuator":"rumble_low_left","steps":[{"amp":128,"dur_ms":100},{"amp":0,"dur_ms":50}]}, {"actuator":"rumble_low_right","steps":[{"amp":128,"dur_ms":100},{"amp":0,"dur_ms":50}]} ] }, "runtime_env":{"LANG":"C","TZ":"UTC","LC_ALL":"C"}, "dur_ms":150 } 
+Rules:
+• attempt.tracks must equal the resolved pattern.tracks.
+• If the device cannot honor exactly (e.g., driver minimum pulse 10 ms), honored must show the effective pattern after driver quantization.
+• If no device present, result:"no_device" and honored.tracks must be all zeros (or absent) of equal dur_ms.
+• A mismatch that isn’t explainable by hcap (e.g., amplitude capped lower than max_amp) ⇒ HAPT_E_HONOR_MISMATCH.
+9) Haptics Certificate (haptics.cert.v1.0)
+Verifier-facing binding & checks.
+{ "schema":"haptics.cert.v1.0", "encoder_id":"…", "ds_registry_id":"…", "hcert_id":"…", "hmap_id":"…", "hcap_id":"…", "pattern_id":"…", "play_id":"…", "assert":{ "map_cap_compatible": true, "attempt_matches_pattern": true, "honored_within_caps": true }, "witness":{ "dt_ms":5, "actuators":["rumble_low_left","rumble_low_right"], "pattern_len_ms":150 }, "notes":"Device honored exactly" } 
+Rules:
+• Recompute pattern from intents (if provided) and hmap; it must equal pattern_id.
+• Compare attempt vs pattern → must match.
+• Compare honored vs attempt using hcap tolerances; class results accordingly.
+10) Hashing & IDs (DSR-bound)
+• hmap_id = H( P_hapt_map || canonical(map_json) ), tag immu.haptics.map.v1.
+• hcap_id = H( P_hapt_cap || canonical(cap_json) ), tag immu.haptics.cap.v1.
+• pattern_id = H( P_hapt_pattern || canonical(pattern_json) ), tag immu.haptics.pattern.v1.
+• play_id = H( P_hapt_play || canonical(play_json) ), tag immu.haptics.play.v1.
+• hcert_id = H( P_hapt_cert || canonical(cert_json) ), tag immu.haptics.cert.v1.
+All bytes canonical per encoder_id. Provide multihash attestations per Crypto Policy.
+11) Verification (acceptance)
+Given hmap_id, hcap_id, pattern_id, play_id, hcert_id:
+• Hash checks & Crypto Policy compliance.
+• Map/Cap check: Ensure actuators/timegrid/amp bits compatible (HAPT_E_CAP_MISMATCH on divergence).
+• Pattern structure: Steps non-empty; durations multiples of dt_ms; amps in range; tracks only from hmap (HAPT_E_PATTERN_RANGE/GRID/CODE).
+• Attempt==Pattern: Structural equality (HAPT_E_ATTEMPT_DIFF).
+• Honored: If result:"ok", must be identical; if clipped|downgraded, differences must be explainable by hcap (e.g., min pulse, max amp) (HAPT_E_HONOR_MISMATCH otherwise).
+• Anchor sanity: anchor.start aligns with Tape or run-relative seconds if used.
+• Pad binding (optional): If padset_id present in hmap, ensure play.pad is in set.
+Accept iff all pass.
+12) Deterministic errors (reason names)
+• HAPT_E_SCHEMA — unsupported schema.
+• HAPT_E_ENCODER — non-canonical bytes.
+• HAPT_E_DSR — unknown/missing DSR tag.
+• HAPT_E_CAP_MISMATCH — device capabilities incompatible with map.
+• HAPT_E_PATTERN_GRID — duration not multiple of dt_ms.
+• HAPT_E_PATTERN_RANGE — amplitude out of 0..(2^bits−1).
+• HAPT_E_PATTERN_CODE — track references unknown actuator.
+• HAPT_E_ATTEMPT_DIFF — attempt does not equal pattern.
+• HAPT_E_HONOR_MISMATCH — honored differs beyond declared caps.
+• HAPT_E_PAD_INDEX — pad index not present in padset (if bound).
+• HAPT_E_HASH — id mismatch after hashing.
+Each failure includes a minimal witness: actuator name, step index, expected vs actual (amp,dur_ms).
+13) Golden vectors (minimum set)
+Place under golden/haptics/v1.0/:
+• Map-A: Two-motor rumble (rumble_low_left/right), dt_ms=5, amp_bits.rumble=8 → hmap_id.
+• Cap-A: Device reports 2 low motors, rate_hz=200, min_pulse_ms=5 → hcap_id.
+• Pattern-A: From intent “global rumble 0.5 for 100 ms; 0 ms ramp” → two tracks amp=128, dur=100, then 50 ms zero → pattern_id.
+• Play-OK: Attempt==Pattern; honored==Attempt; result:"ok" → play_id.
+• Play-Clipped: Same pattern but hcap.max_amp=120; honored clamps to 120 → result:"clipped" (acceptable).
+• Grid-Fail: Pattern step dur_ms=7 → HAPT_E_PATTERN_GRID.
+• Honor-Mismatch: Device claims min_pulse_ms=10 but honored shows 5 ms pulses → HAPT_E_HONOR_MISMATCH.
+Each vector includes canonical bytes hex, DSR preludes, and expected digests.
+14) Interaction with other planes
+• Tape/Parity: Haptics are outputs only; parity is unaffected. Tapes may reference haptic anchors (ticks/seconds) but need not embed patterns.
+• SDR: Rules may decide to mute or defer haptics when battery low (result:"muted_by_os" or intentional attempt omitted). Decision is recorded in SDR; semantics unchanged.
+• PCV: You can correlate power draw with haptics by comparing PCV windows overlapping pattern anchors.
+• Gamepad Map: padset_id stabilizes which gamepad received haptics.
+• Heals/Transport: Patterns and plays are CAS blobs; can be vacuumed like other evidence.
+15) What this does not change (stability)
+• No change to interpreter/staged semantics, gas model, capability lineage, policy admission, or effects containment.
+• No dependency on wall clock or network; anchors are run-relative.
+• No hardware feedback loops; verification is structural and capability-bounded.
+End of Slice 15.
+Say continue to proceed. Natural next slices that dovetail:
+• Per-Tick Admission v1.0 (contexts that change across frames with witnesses),
+• Export Bundle Cert v1.0 (sealed, reproducible Godot exports), or
+• Input Latency Budget v1.0 (evidence-first timing windows without wall-clock drift).
+Slice 16 — Per-Tick Admission v1.0 (Context Windows & OML Witnesses)
+(Fully expanded, single sealed module. Builds on Slices 1–15. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• Sealed Admission Profile that defines how execution context(s) are chosen over time.
+• Sealed Context Series that binds concrete OML context IDs to tick/second windows.
+• Sealed Per-Tick Admission Record that proves need ≤ ctx (with meet witness) for the exact needs used in that tick/window.
+• A Series Certificate that verifies coverage, transitions, and that all recorded needs are admitted by the bound context.
+• Deterministic rules, hashing, errors, and golden vectors.
+Out-of-scope (deferred): redesigning your OML lattice or Cap model; changing program semantics, gas, parity, or ABI; networked policy fetch. This slice is evidence-first and semantics-preserving.
+Depends on:
+• Policy Plane / OML (Slice 4): atoms, contexts, orthomodularity checks, context_id, compat_witness.
+• Effects / ClassMap (Slice 6): effect classes and need shapes.
+• Parity v1.1 (Slice 4): unchanged; parity already includes policy_id.
+• PCV v1.0 (Slice 11) & SDR v1.0 (Slice 12): optional pure inputs to choose contexts.
+• Proof Plane (Slice 2): txn certs can already include context_id + witnesses; this slice organizes them per tick.
+• Canonical serialization (encoder_id) & Crypto Policy (Slice 10).
+Stability note: Context choice must be a pure function of sealed inputs (profile + optional PCV/SDR + Tape anchors). No wall clock, RNG, or network.
+1) Purpose (one paragraph)
+You often want different security/IO envelopes during different phases—e.g., “no network while loading,” “FS RO during gameplay,” “enable export tools during build.” Per-Tick Admission makes that change auditable: you pre-declare how contexts change, bind the exact context_id to each tick/second window, and record per-tick need admissions with OML witnesses. Verifiers can then scan the whole run offline and check that every need was contained by the active context.
+2) DSR tags (append-only)
+• immu.admit.profile.v1 — Admission Profile (how contexts are selected).
+• immu.admit.series.v1 — Context Series (which context per window).
+• immu.admit.tick.v1 — Per-Tick Admission Record (needs & witnesses).
+• immu.admit.cert.v1 — Admission Series Certificate (verifier-facing).
+Publishing this slice implies a new ds_registry_id that includes these tags.
+3) Core semantics (recap & normalization)
+• Need (need_id): an element of the OML lattice that over-approximates the set of effects the program may perform in a window (derived from Effects/ClassMap and the executed op set).
+• Context (context_id): a Boolean block (OML context) that encodes the allowed atoms; carries compat_witness.
+• Admission test (normative): 
+• Algebraic form: meet(ctx, need) == need
+• Order form: need ≤ ctx
+Per Slice 4, both forms must be present in the witness for each record.
+• Containment invariant: For every window, all realized needs must satisfy the admit test against the bound context.
+4) Admission Profile (admit.profile.v1.0)
+A sealed, pure rule for selecting contexts over windows.
+{ "schema":"admit.profile.v1.0", "encoder_id":"…", "ds_registry_id":"…", "profile_id":"…", // §10 hashing "anchor":{"mode":"ticks|seconds","size":60,"align":"left","overlap":0}, "inputs":{ "policy_id":"…", // OML lattice snapshot this profile expects "pcv_profile_id": "…", // optional; if used by rules "constants":{"ctx_loading":"…","ctx_play":"…","ctx_export":"…"} }, "action_space":{"contexts":["…","…","…"]}, // whitelisted context_ids "logic":{ // pure JSON AST, SDR-style "kind":"if_chain", "clauses":[ { "if":{"any":[{"==":["phase","loading"]},{"<":["tick",300]}]}, "then":{"context_id":"ctx_loading","reason":"initial load"} }, { "if":{"all":[{">=":["batt_pct_mean",30]},{"<":["temp_cpu_max",60000]}]}, "then":{"context_id":"ctx_play","reason":"normal play"} }, { "else":{"context_id":"ctx_play","reason":"fallback"} } ] }, "tiebreak":"lexicographic", "notes":"Context windows of 60 ticks; rules may read PCV features if provided" } 
+Rules (normative):
+• logic uses the same pure operator set as SDR v1.0 (Slice 12).
+• Allowed identifiers in if conditions: "tick", "window_index", declared PCV feature names, or profile constants. Forbidden: wall clock, RNG, host identity, network, or any mutable external state.
+• action_space.contexts is a hard allowlist; any rule output must be in it.
+5) Context Series (admit.series.v1.0)
+The actual assigned contexts per window.
+{ "schema":"admit.series.v1.0", "encoder_id":"…", "ds_registry_id":"…", "series_id":"…", // §10 hashing "profile_id":"…", "coverage":{"mode":"ticks","start":0,"end":600}, // right-open "windows":[ {"w":0,"anchor":{"start":0,"size":60},"context_id":"…","reason":"initial load"}, {"w":1,"anchor":{"start":60,"size":60},"context_id":"…","reason":"normal play"}, {"w":2,"anchor":{"start":120,"size":60},"context_id":"…","reason":"normal play"} ], "witness":{"policy_id":"…","compat_witnesses":[ /* optional cached ctx compat */ ]} } 
+Rules:
+• Windows are contiguous, non-overlapping, same size/mode as the profile.
+• Each context_id must belong to the profile’s action_space.contexts.
+• reason is operator-facing, non-normative.
+• A series can be produced either by evaluating the profile’s logic or by any equivalent sealed generator; verifiers will re-evaluate and compare (see §9).
+6) Per-Tick Admission Record (admit.tick.v1.0)
+What needs occurred in a window, and their witnesses against the bound context.
+{ "schema":"admit.tick.v1.0", "encoder_id":"…", "ds_registry_id":"…", "record_id":"…", // §10 hashing "series_id":"…", "window":{"w":1,"anchor":{"mode":"ticks","start":60,"size":60}}, "context_id":"…", "needs":[ // minimal closed set for this window {"need_id":"…","from":"effects:io.read","count":12,"bytes":1048576}, {"need_id":"…","from":"effects:mem.cache.write","count":2,"bytes":8192} ], "witnesses":[ { "need_id":"…","context_id":"…", "admit_forms":{ "meet_eq": true, "leq": true }, "meet_path":["…"], // GLB witness ids from OML "compat_witness":["atom_fs_ro","atom_net_off"], // per Slice 4 "explain":"mem.cache writes allowed; no net" } ], "links":{ "txn_cert_ids":["…","…"], // optional: certs proving these ops "effect_signature_id":"…", // if used "write_set_digest":"…" } } 
+Rules:
+• needs[] is the minimal set of distinct needs realized in the window (post-coalescing by class), derived either from transaction cert bundles or from an effect signature evaluated against the executed op set.
+• Every need_id in needs[] must have a corresponding witnesses[] entry proving need ≤ ctx.
+• links are cross-references only; the admission record does not alter proof semantics.
+7) Admission Series Certificate (admit.cert.v1.0)
+Verifier-facing summary over the whole series.
+{ "schema":"admit.cert.v1.0", "encoder_id":"…", "ds_registry_id":"…", "cert_id":"…", // §10 hashing "profile_id":"…", "series_id":"…", "records":["…","…","…"], // record_ids covering the series "assert":{ "profile_reproduced": true, "full_coverage": true, "no_overlap": true, "all_needs_admitted": true }, "witness":{ "coverage":{"mode":"ticks","start":0,"end":600}, "window_size":60, "policy_id":"…", "contexts_used":["…","…"] }, "notes":"All windows pass admit test; two contexts used" } 
+Rules:
+• profile_reproduced means a verifier re-evaluated the profile’s logic across coverage and obtained the same context_id per window.
+• full_coverage means every window in coverage has exactly one admit.tick record and one context_id entry.
+• all_needs_admitted means every need in every record passed both meet_eq and leq checks with valid witnesses.
+8) Inputs allowed in profiles (purity fence)
+Exactly as SDR v1.0, only:
+• tick, window_index, and profile constants.
+• Declared PCV features (Slice 11) from the matching PCV Profile.
+• Optional binary flags derived from Tape (e.g., "phase":"loading|play|export") if sourced from sealed, deterministic cues (e.g., scene change events recorded in Tape).
+Forbidden: wall-clock timestamps, random numbers, network responses, host identity, OS process lists, floating system load averages, etc. Any use ⇒ ADMIT_E_NONPURE.
+9) Verification procedure (acceptance)
+Given profile_id, series_id, {record_id…}, and optionally pcv.series or Tape anchors:
+• Hash & policy checks: All IDs recompute; policy_id in profile/series matches OML snapshot; suites satisfy Crypto Policy.
+• Profile re-evaluation: For each window in series.coverage, recompute context_id from the profile logic using only allowed inputs. Compare with series.windows[w].context_id. If any differ ⇒ ADMIT_E_PROFILE_REPRO.
+• Series structure: Windows contiguous, non-overlapping; context_id in allowlist; coverage matches. Else ADMIT_E_SERIES_COVER.
+• Record coverage: For each window, ensure exactly one admit.tick record with matching anchor. Else ADMIT_E_RECORD_COVER.
+• Need derivation: For each record, reconstruct needs[] from linked txn_cert_ids and/or effect_signature_id; ensure the record’s needs is a superset of the reconstructed minimal set and no extras. Else ADMIT_E_NEED_SET.
+• Admit witnesses: For each (need, ctx) pair, recompute meet(ctx, need) and need ≤ ctx; verify compat_witness belongs to the same Boolean block and is valid. Else ADMIT_E_WITNESS.
+• Certificate assertions: Recompute booleans in cert.assert.*. If any mismatch ⇒ ADMIT_E_CERT_ASSERT.
+Accept iff all pass; otherwise reject with a minimal witness (window index, offending need_id, or clause index).
+10) Hashing & IDs (DSR-bound)
+• profile_id = H( P_admit_profile || canonical(profile_json) ), tag immu.admit.profile.v1.
+• series_id = H( P_admit_series || canonical(series_json) ), tag immu.admit.series.v1.
+• record_id = H( P_admit_tick || canonical(record_json) ), tag immu.admit.tick.v1.
+• cert_id = H( P_admit_cert || canonical(cert_json) ), tag immu.admit.cert.v1.
+Canonically encoded per encoder_id; multihash attestations per Crypto Policy (Slice 10).
+11) Deterministic errors (reason names)
+• ADMIT_E_SCHEMA — unsupported schema (profile/series/record/cert).
+• ADMIT_E_ENCODER — non-canonical bytes.
+• ADMIT_E_DSR — missing/unknown DSR tag.
+• ADMIT_E_NONPURE — profile logic references forbidden inputs.
+• ADMIT_E_SERIES_COVER — series windows not contiguous, wrong size/mode, or coverage mismatch.
+• ADMIT_E_PROFILE_REPRO — verifier cannot reproduce profile’s context choice.
+• ADMIT_E_RECORD_COVER — missing/duplicate record for a window.
+• ADMIT_E_NEED_SET — record’s needs missing an actual need or includes an extra.
+• ADMIT_E_WITNESS — meet(ctx, need) != need or need ≤ ctx not witnessed correctly (bad or mismatched compat_witness).
+• ADMIT_E_CERT_ASSERT — series certificate asserts flags that don’t hold.
+• ADMIT_E_HASH — id mismatch after hashing.
+Each failure returns a minimal witness: window index, need_id, context_id, and the computed vs recorded outcome.
+12) Golden vectors (minimum set)
+Place under golden/admission/v1.0/:
+• Profile-A: Anchor ticks size 60; contexts {ctx_loading, ctx_play}; rule “tick<300 ⇒ loading else play” → profile_id.
+• Series-A: Coverage [0,600) with five windows mapping to {loading,loading,loading,play,play} → series_id.
+• Tick-A: Window w=3 (play): needs=[io.read, mem.cache.write] with valid OML witnesses → record_id.
+• Cert-A: Binds (1)–(3); asserts all true → cert_id.
+• Repro-Fail: Flip one window’s context to ctx_loading after tick>=300 → ADMIT_E_PROFILE_REPRO.
+• Need-Fail: Remove mem.cache.write need from the record while proofs show writes → ADMIT_E_NEED_SET.
+• Witness-Fail: Keep need but provide a context missing mem.cache.write atoms → ADMIT_E_WITNESS.
+• Coverage-Fail: Omit w=2 record → ADMIT_E_RECORD_COVER.
+Vectors include canonical bytes hex, DSR preludes, and expected digests.
+13) Interaction with other planes
+• Proof Plane: Per-tick record can point to the actual txn_cert objects for the window; verifiers may re-check write_set_digest ⊆ effects and then admission (need ≤ ctx).
+• Policy Plane (OML): Reuses your existing lattice; this slice just indexes needs/witnesses by time windows.
+• SDR/PCV: Profiles may read PCV features (e.g., pick stricter context if temp high) as long as logic stays pure; any such choice must reproduce under the same PCV windows.
+• Parity: Unchanged. Admission evidence is not in the parity tuple; failures are caught during verification.
+• Godot/GDAP: Useful to tighten context (e.g., export contexts) during deterministic builds.
+14) What this does not change (stability)
+• No edits to OML algebra, Effects, Cap lineage, or gas.
+• No runtime nondeterminism—context choice is sealed and reproducible; anchors are tick/second run-relative.
+• No new executors; admission is an audit layer with witnesses.
+End of Slice 16.
+Say continue to proceed. Natural next slices that dovetail:
+• Export Bundle Cert v1.0 (sealed, reproducible Godot exports with multihash),
+• Input Latency Budget v1.0 (evidence-first input timing windows on relative clocks), or
+• Operator Console Evidence v1.0 (loopback UX transcripts & allowlist provenance).
+Slice 17 — Export Bundle Cert (EBC) v1.0 — Sealed, Reproducible Godot Exports
+(Fully expanded, single sealed module. Builds on Slices 1–16. Evidence-only; no semantic change. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• Canonical, platform-neutral Export Profile (deterministic knobs & cordon).
+• Canonical Resource Set (exact files to export, with digests, from GDAP/Godot project).
+• Canonical Export Plan (graph/order, container format & packing rules).
+• Canonical Export Run (toolchain fingerprints, transcript).
+• Canonical Export Artifact (single-file bundle, bytestream-equal across hosts).
+• Export Manifest (file list inside the artifact, with per-entry digests).
+• Export Certificate (verifier-facing assertions & witnesses).
+Out-of-scope (deferred): Code signing/distribution (lives with Upgrade/EP signing); platform SDK provisioning; app store metadata.
+Depends on:
+• GDAP v1.0 (Slice 14) for deterministic imports/caches;
+• DSR v1.0 (Slice 3), Crypto Policy v1.0 (Slice 10);
+• Effects/Capabilities (Slice 6–7) — exports write to mem.cache-like regions only;
+• Parity/Policy unchanged (Slice 4).
+• PCV/SDR/Admission/Heals optional; they can schedule/monitor but not alter bytes.
+Stability note: EBC produces a sealed bundle from sealed inputs; no program semantics change and no network/wall-clock is consulted.
+1) Purpose (one paragraph)
+Godot exports vary with editor builds, OS locale, timestamps, and container quirks. EBC fixes this by (1) freezing export settings and environment, (2) enumerating the resource set by content hash, (3) executing a deterministic packer (tar/zip/APK-unsigned-aligned) with canonical metadata, and (4) issuing an Export Certificate that any verifier can replay offline to confirm byte-identical output.
+2) DSR Tags (append-only)
+• immu.ebc.profile.v1 — Export Profile.
+• immu.ebc.rset.v1 — Resource Set.
+• immu.ebc.plan.v1 — Export Plan.
+• immu.ebc.run.v1 — Export Run.
+• immu.ebc.manifest.v1 — Export Manifest (inside-bundle listing).
+• immu.ebc.artifact.v1 — Export Artifact (bundle descriptor).
+• immu.ebc.cert.v1 — Export Certificate.
+Publishing this slice implies a new ds_registry_id that includes all tags above.
+3) Export Profile (ebc.profile.v1.0)
+Freeze the export knobs & cordon; mirror Godot “Export Preset” but deterministic.
+{ "schema":"ebc.profile.v1.0", "encoder_id":"…", "ds_registry_id":"…", "profile_id":"…", // §10 hashing "engine":{ "flavor":"headless", "engine_ver":"4.x.y-custom", "module_hash":"blake3:…", "export_templates_hash":"blake3:…" // hash of export templates dir }, "defaults":{ "locale":"C","tz":"UTC","threads":1, "source_date_epoch":"1731024000", "random_seed":0, "platform":"deterministic" }, "packing":{ "container":"zip|tar|apk-ua", // apk-ua = APK unsigned, 4-byte aligned "zip":{"method":"store","strip_extra":true,"zip64":false}, "tar":{"format":"pax","uid":0,"gid":0,"mode_files":"0644","mode_exec":"0755"}, "apk":{"align_bytes":4,"no_meta_inf":true} }, "paths":{ "root_dir":"res://", // logical base "out_rel":"build/export/game.bundle" // canonical output path (evidence) }, "filters":{ "include_patterns":["res://**/*"], "exclude_patterns":["res://.import/**","res://.git/**","**/*.tmp"] }, "notes":"Lossless, single-threaded export; no per-platform toggles" } 
+Normative rules
+• Threads=1; locale/tz/SDE pinned as shown.
+• container=zip uses STORE (no compression) for determinism; strip_extra removes variable extra fields; set mtimes to SDE.
+• container=tar uses pax with fixed owners/modes & SDE mtimes.
+• container=apk-ua is unsigned APK, zip-aligned, no META-INF; signing is a separate Upgrade step.
+• Any setting not listed is forbidden in v1.0 (EBC_E_PROFILE_FORBID).
+4) Resource Set (ebc.rset.v1.0)
+Exact files and bytes to export (already determinized via GDAP or raw sources).
+{ "schema":"ebc.rset.v1.0", "encoder_id":"…", "ds_registry_id":"…", "rset_id":"…", "profile_id":"…", "src_id":"…", // GDAP source tar id (Slice 14) "cache_id":"…", // GDAP cache manifest (optional if all raw) "entries":[ {"path":"res://main.tscn","digest":"blake3:…","bytes":81234,"exec":false}, {"path":"res://assets/tex/logo.png","digest":"blake3:…","bytes":4096,"exec":false}, {"path":"res://bin/launch.sh","digest":"blake3:…","bytes":512,"exec":true} ], "digests":{"entry_set":"blake3:…"} } 
+Rules
+• entries lexicographically sorted by path (UTF-8 NFC, / separators, no ..).
+• If cache_id present, entries[*].digest must match corresponding GDAP artifact digests; else EBC_E_CACHE_MISS.
+• exec controls tar/zip POSIX mode (0755 vs 0644) in tar; in zip, store mode flags in a deterministic extra field or omit (v1 ok to omit; rely on runtime to set exec bit if needed).
+5) Export Plan (ebc.plan.v1.0)
+Deterministic order and packing instructions.
+{ "schema":"ebc.plan.v1.0", "encoder_id":"…", "ds_registry_id":"…", "plan_id":"…", "profile_id":"…", "rset_id":"…", "order":"lex", // or "toposort_lex" if deps are modeled "repro":{ "mtime":"SOURCE_DATE_EPOCH", "uid":0,"gid":0,"uname":"","gname":"" }, "container":"zip|tar|apk-ua", "notes":"Pack in lex order; fixed mtimes; no META-INF" } 
+Rules
+• Order is normative; packer must emit entries in order.
+• APK unsigned-aligned requires zip central directory with 4-byte alignment and no META-INF; file mtimes all SDE.
+6) Export Run (ebc.run.v1.0)
+What was actually executed.
+{ "schema":"ebc.run.v1.0", "encoder_id":"…", "ds_registry_id":"…", "run_id":"…", "profile_id":"…","rset_id":"…","plan_id":"…", "toolchain":{ "godot":{"path":"…/godot-headless","ver":"4.x.y","sha":"blake3:…"}, "templates_hash":"blake3:…", "packer":{"bin":"zip|tar|apkalign","ver":"…","sha":"blake3:…"}, "env":{"LANG":"C","TZ":"UTC","LC_ALL":"C","SOURCE_DATE_EPOCH":"1731024000"} }, "exec":{"threads":1,"sandbox":"no-net,no-gpu","container":"zip"}, "transcript":[ {"op":"add","path":"res://main.tscn","digest":"blake3:…","bytes":81234}, {"op":"add","path":"res://assets/tex/logo.png","digest":"blake3:…","bytes":4096} ], "dur_s":2.71 } 
+Rules
+• No plugins unless hashed and included in engine.module_hash; any plugin drift ⇒ EBC_E_TOOLCHAIN.
+• sandbox forbids network; build must not read host time; wall-clock logs are evidence-only.
+7) Export Artifact (ebc.artifact.v1.0) & Manifest (ebc.manifest.v1.0)
+Artifact descriptor:
+{ "schema":"ebc.artifact.v1.0", "encoder_id":"…", "ds_registry_id":"…", "artifact_id":"…", "profile_id":"…","rset_id":"…","plan_id":"…","run_id":"…", "container":"zip", "bytes": 10485760, "digest":"blake3:…", // digest of the bundle bytestream "path":"build/export/game.bundle" } 
+Inside-bundle manifest (independent CAS object):
+{ "schema":"ebc.manifest.v1.0", "encoder_id":"…", "ds_registry_id":"…", "manifest_id":"…", "artifact_id":"…", "entries":[ {"path":"main.tscn","digest":"blake3:…","bytes":81234,"mtime":"1731024000"}, {"path":"assets/tex/logo.png","digest":"blake3:…","bytes":4096,"mtime":"1731024000"} ], "digests":{"entry_set":"blake3:…"} } 
+Rules
+• manifest.entries paths are bundle-relative (no res:// prefix).
+• Digests must match those in rset.entries, 1:1.
+• mtime must equal SDE; verifier may ignore container headers and rely on manifest for content integrity.
+8) Export Certificate (ebc.cert.v1.0)
+Verifier-facing attestations.
+{ "schema":"ebc.cert.v1.0", "encoder_id":"…", "ds_registry_id":"…", "cert_id":"…", // §10 hashing "profile_id":"…","rset_id":"…","plan_id":"…", "run_id":"…","artifact_id":"…","manifest_id":"…", "assert":{ "toolchain_frozen": true, "env_cordon_ok": true, "order_respected": true, "manifest_matches_rset": true, "artifact_matches_manifest": true }, "witness":{ "entry_set_rset":"blake3:…", "entry_set_manifest":"blake3:…", "artifact_digest":"blake3:…", "container":"zip" }, "notes":"Unsigned APK/ZIP bytestream equals recomputed pack" } 
+Rules
+• Verifier re-packs from rset under plan & profile and must obtain the same artifact.digest.
+• manifest must list exactly the files in rset (path-stripped), same order & sizes.
+• toolchain_frozen: engine/template hashes & packer binary hash equal run records; env equals cordon.
+9) Deterministic Packing Rules (normative)
+ZIP (container="zip")
+• Method: store (no compression) in v1.0 (deflate may be allowed in future with deterministic deflater).
+• Timestamps: set to SOURCE_DATE_EPOCH.
+• Extra fields: strip all (-X equivalent).
+• Order: lex path order from rset.
+• Zip64: disabled unless any file ≥4 GiB; if enabled, do so for all entries (uniformity).
+• Attributes: leave platform-specific attrs blank; exec flags ignored (documented).
+TAR/PAX (container="tar")
+• Format: PAX.
+• Ownership: uid=0,gid=0,uname="",gname="".
+• Mode: 0644 or 0755 per rset.exec.
+• mtime: SDE.
+• Order: lex path order.
+APK unsigned-aligned (container="apk-ua")
+• Base: ZIP rules plus: 
+• Alignment: 4-byte alignment for all stored entries.
+• META-INF: absent (no signatures).
+• Resources: included exactly as specified in rset.
+• Signing: deferred to Upgrade plane; a separate Signature Attestation (future slice) binds signatures to artifact.digest.
+10) Hashing & IDs (DSR-bound)
+• profile_id = H( P_ebc_profile || canonical(profile_json) ), tag immu.ebc.profile.v1.
+• rset_id = H( P_ebc_rset || canonical(rset_json) ), tag immu.ebc.rset.v1.
+• plan_id = H( P_ebc_plan || canonical(plan_json) ), tag immu.ebc.plan.v1.
+• run_id = H( P_ebc_run || canonical(run_json) ), tag immu.ebc.run.v1.
+• artifact_id = H( P_ebc_artifact || canonical(artifact_json) ), tag immu.ebc.artifact.v1.
+• manifest_id = H( P_ebc_manifest || canonical(manifest_json) ), tag immu.ebc.manifest.v1.
+• cert_id = H( P_ebc_cert || canonical(cert_json) ), tag immu.ebc.cert.v1.
+Multihash attestations per Crypto Policy v1.0 satisfy dual-suite requirements for artifact.digest, entry_set_*, etc.
+11) Verification Procedure (acceptance)
+Given profile_id, rset_id, plan_id, run_id, artifact_id, manifest_id, cert_id:
+• Hash/Policy: recompute all; ensure required suites present.
+• Profile sanity: threads=1; container rules valid; forbidden fields absent (EBC_E_PROFILE_FORBID).
+• Rset vs GDAP: if cache_id present, check that each digest corresponds to GDAP outputs (EBC_E_CACHE_MISS).
+• Plan adherence: order recognized; repro values equal profile cordon.
+• Repack: deterministically repack rset per plan/profile; obtain repacked_digest. Compare to artifact.digest (EBC_E_ARTIFACT_DIFF on mismatch).
+• Manifest match: recompute entry_set_manifest from inside-bundle manifest and compare to entry_set_rset after stripping res:// prefixes (EBC_E_MANIFEST_SET).
+• Run/toolchain: binary hashes & template hash match; env cordon equal; sandbox flag present (EBC_E_TOOLCHAIN/EBC_E_ENV).
+• Cert assertions: recompute booleans; mismatch ⇒ EBC_E_CERT_ASSERT.
+Accept iff all pass; else return a minimal witness (first offending path, digest pair, or field).
+12) Deterministic Errors (reason names)
+• EBC_E_SCHEMA — unsupported schema.
+• EBC_E_ENCODER — non-canonical bytes.
+• EBC_E_DSR — unknown/missing DSR tag.
+• EBC_E_PROFILE_FORBID — profile uses disallowed/unstable setting.
+• EBC_E_CACHE_MISS — rset entry not found/mismatched in GDAP cache.
+• EBC_E_ORDER — pack order diverges from plan.order.
+• EBC_E_ARTIFACT_DIFF — repacked digest ≠ recorded artifact digest.
+• EBC_E_MANIFEST_SET — manifest file set ≠ rset file set.
+• EBC_E_TOOLCHAIN — engine/templates/packer hash mismatch.
+• EBC_E_ENV — env cordon violated (LANG/TZ/LC_ALL/SDE).
+• EBC_E_CONTAINER — container-specific invariant failed (zip64 uniformity, apk alignment, tar ownership/mode).
+• EBC_E_CERT_ASSERT — certificate asserts flags that don’t hold.
+• EBC_E_HASH — id mismatch after hashing.
+13) Golden Vectors (minimum set)
+Place under golden/ebc/v1.0/:
+• Profile-A (zip-store): SDE=1731024000, zip store, strip extra → profile_id.
+• Rset-A: res://main.tscn, res://assets/tex/logo.png, res://bin/launch.sh(exec) → rset_id.
+• Plan-A: order:"lex", container zip, pax repro fields → plan_id.
+• Run-A: toolchain hashes, env cordon, transcript for 3 files → run_id.
+• Artifact-A: digest provided (hex), bytes exact → artifact_id.
+• Manifest-A: lists the two files + script with SDE mtimes → manifest_id.
+• Cert-A: asserts all true; entry_sets and artifact_digest equal → cert_id.
+• Fail-Order: shuffle one entry during repack → EBC_E_ORDER.
+• Fail-Env: set TZ to America/New_York → EBC_E_ENV.
+• Fail-APK-Align: build apk-ua with non-4B alignment → EBC_E_CONTAINER.
+• Fail-Artifact: flip one byte in bundle → EBC_E_ARTIFACT_DIFF.
+Each vector includes canonical bytes hex, preludes, expected digests.
+14) Interaction with Other Planes
+• GDAP: Rset is typically derived from GDAP cache; dedup enabled by content addressing.
+• Effects/Policy: Exports write into mem.cache regions only; policy must admit those effects if run; admissions witnessed per Slice 16.
+• SDR/PCV: Use SDR to schedule exports (e.g., defer on low battery) without affecting bytes; PCV evidence tags the export window.
+• Heals: Export artifacts may be vacuumed/packed; Heal Cert proves reachable set unchanged.
+• Upgrade: Signing/release manifests are handled by Upgrade Plane; they reference artifact.digest and produce separate signature attestations.
+15) What This Does Not Change (stability)
+• No change to interpreter/staged semantics, parity tuple, gas, capability lineage, OML lattice, or effect containment.
+• No reliance on network, host identity, or wall clock.
+• No platform drift: platform toggles are disabled; container formats are normalized.
+End of Slice 17.
+Say continue to proceed. Natural next slices that dovetail:
+• Input Latency Budget v1.0 (evidence-first input timing using relative clocks),
+• Operator Console Evidence v1.0 (sealed loopback UX transcripts & allowlist provenance), or
+• Signature Attestation v1.0 (deterministic, offline signing that binds signatures to export artifacts).
+Slice 18 — Input Latency Budget (ILB) v1.0 — Evidence-First Input Timing on Relative Clocks
+(Fully expanded, single sealed module. Builds on Slices 1–17. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• Sealed Binding Map (device→logical input→action) — deterministic, device-agnostic.
+• Sealed Input Capture Profile — what we record for each raw event, and the anchoring.
+• Sealed Event Log — normalized input events on a run-relative timeline (no wall clock).
+• Sealed Latency Budget Profile — per-segment & per-action tick/second budgets.
+• Sealed Latency Record — per interaction {event→bind→effect→present} with deltas.
+• Sealed Latency Certificate — verifier-facing coverage & budget compliance.
+• Canonical encodings, DSR tags, hashing, deterministic errors, and golden vectors.
+Out-of-scope (deferred): eye-tracker/camera inputs; OS driver timestamps; end-to-end “photon” latency. v1.0 is software pipeline only (input queue → action bind → state commit → present intent/haptics anchor).
+Depends on:
+• Gamepad Map v1.0 (Slice 9) — device normalization (pad ids/codes).
+• Tape v1.0 (Slice 1) — ticks/seconds anchors (run-relative).
+• Haptics v1.0 (Slice 15) — present/haptics anchors.
+• Admission v1.0 (Slice 16) — per-window context (optional reference).
+• GDAP/EBC (Slices 14 & 17) — unrelated to latency but share env cordon.
+• Canonical serialization (encoder_id), Crypto Policy (Slice 10).
+• Parity/Effects/Policy — unchanged; ILB is evidence-only.
+Stability note: ILB must not change control flow, scheduling, or semantics. It provides auditable timing evidence on run-relative anchors (ticks or monotone seconds), never wall time.
+1) Purpose (one paragraph)
+You want to prove that inputs flow through your deterministic stack promptly—without introducing clocks that wreck determinism. ILB captures normalized input events, binds them through your sealed action map, stamps each interaction at four deterministic anchors, and verifies that per-segment latencies stay within sealed budgets. Everything is reproducible offline from the EP: same events, same anchors, same deltas, same pass/fail.
+2) DSR Tags (append-only)
+• immu.input.bindmap.v1 — Binding Map.
+• immu.input.profile.v1 — Input Capture Profile.
+• immu.input.events.v1 — Event Log.
+• immu.input.budget.v1 — Latency Budget Profile.
+• immu.input.latency.v1 — Latency Record.
+• immu.input.cert.v1 — Latency Certificate.
+Publishing this slice implies a new ds_registry_id with the tags above.
+3) Binding Map (input.bindmap.v1.0)
+Deterministic mapping from normalized device signals to Action IDs.
+{ "schema":"input.bindmap.v1.0", "encoder_id":"…", "ds_registry_id":"…", "bindmap_id":"…", // §11 hashing "padset_id":"…", // from Slice 9 (optional) "layout":"xinput|dualshock4|dualsense|generic", "bindings":[ {"src":{"kind":"button","code":"A"},"action":"act_jump"}, {"src":{"kind":"button","code":"B"},"action":"act_cancel"}, {"src":{"kind":"axis","code":"LX","deadzone":0.10,"curve":"linear"},"action":"ax_move_x"}, {"src":{"kind":"axis","code":"LY","deadzone":0.10,"curve":"linear"},"action":"ax_move_y"} ], "rules":{ "axis_quant_bits":10, // normalized fixed-point for action emissions "button_edge":"press-only" // no repeat; v1.0 forbids OS repeats }, "notes":"Logical mapping post Gamepad Map normalization" } 
+Rules (normative):
+• action names are stable identifiers (lowercase snake_case); action_id = H("act:"||action).
+• Axes are normalized to fixed-point signed integers with axis_quant_bits (e.g., 10 → −512..+511).
+• Button repeats from OS are ignored in v1.0; only edges generate binds.
+• Bindings are pure; no script callbacks here.
+4) Input Capture Profile (input.profile.v1.0)
+Specifies what to record for raw events, and how to anchor them.
+{ "schema":"input.profile.v1.0", "encoder_id":"…", "ds_registry_id":"…", "profile_id":"…", "anchor":{"mode":"ticks|seconds","quant":"ticks|us","ticks_per_frame":1}, "normalize":{ "deadzone_apply":true, "axis_quant_bits":10, "button_edge_mode":"press-only" }, "fields":[ "device_id","pad_index","code","kind","value_q","anchor_value","qseq" ], "privacy":{ "coords_allow":false, // v1.0 default: no touchscreen XY "raw_values_hash_only":false }, "notes":"Run-relative anchors; monotone seconds allowed only if run-local" } 
+Rules:
+• anchor.mode chooses the line of time; if "seconds", the recorder must use a run-relative monotone counter (not wall clock).
+• quant:"ticks" records integer frame indices; "us" records microseconds since run start.
+• qseq is a monotone per-device queue sequence (uint64) to ensure order.
+• Touch/XY default off in v1.0 to avoid privacy issues; enable in a future slice with quantization grids.
+5) Event Log (input.events.v1.0)
+Canonical list of normalized events.
+{ "schema":"input.events.v1.0", "encoder_id":"…", "ds_registry_id":"…", "events_id":"…", // §11 hashing "profile_id":"…", "bindmap_id":"…", "coverage":{"mode":"ticks","start":0,"end":600}, "events":[ { "evt_id":"…", "device_id":"vid:045e/pid:0b12", "pad_index":0, "kind":"button","code":"A", "value_q":1, // edge → 1 "anchor":{"tick":241}, // or {"us":1234567} "qseq":1024 } ], "digests":{"evt_set":"blake3:…"} // H(sorted evt_id) } 
+Rules:
+• Events are sorted by (anchor, qseq); ties broken lexicographically by (device_id, code).
+• Only normalized, quantized values appear.
+• For axes, emit on edge past deadzone or at fixed cadence if desired (future ext); v1.0 focuses on discrete edges for latency.
+6) Latency Budget Profile (input.budget.v1.0)
+Sealed budgets per segment and (optionally) per action.
+{ "schema":"input.budget.v1.0", "encoder_id":"…", "ds_registry_id":"…", "budget_id":"…", "anchor":{"mode":"ticks|seconds","quant":"ticks|us"}, "segments":[ {"name":"E0_E1_bind","ticks_max":1,"us_max":null}, // event→bind {"name":"E1_E2_commit","ticks_max":1,"us_max":null}, // bind→state commit {"name":"E2_E3_present","ticks_max":1,"us_max":null}, // commit→present intent {"name":"E0_E3_total","ticks_max":3,"us_max":null} // end-to-end in-pipeline ], "per_action":{ "act_jump":{"E0_E3_total":{"ticks_max":2}}, "act_cancel":{"E0_E3_total":{"ticks_max":3}} }, "classify":{"soft_over":"warn","hard_over":"fail"} } 
+Rules:
+• All thresholds are non-negative integers; null means “not checked in this unit”.
+• If both ticks_max and us_max are set, both must be satisfied.
+• classify decides whether an overage is a warning or failure at verification. No runtime gating permitted here.
+7) Anchors & Segments (normative)
+For each interaction (an event that resulted in an action), record these anchors:
+• E0 (event_ingest): the event’s anchor from the Event Log.
+• E1 (action_bind): the tick/us when the Binding Map produced an Action ID for this event.
+• E2 (state_commit): the tick/us when the action caused a transaction commit (the cert’s pre_root→post_root). If purely UI/no state write, use the tick when the effect signature was admitted.
+• E3 (present_intent): the tick/us when the frame that reflects the action is queued for present (or haptic/audio pattern anchor). This is a software intent, not a panel scanout time.
+Segments:
+• E0_E1_bind, E1_E2_commit, E2_E3_present, E0_E3_total.
+All anchors are run-relative; no wall-clock.
+8) Latency Record (input.latency.v1.0)
+Per-interaction measurement with deterministic deltas.
+{ "schema":"input.latency.v1.0", "encoder_id":"…", "ds_registry_id":"…", "lat_id":"…", // §11 hashing "events_id":"…", "bindmap_id":"…", "budget_id":"…", "interaction":{ "evt_id":"…", "action_id":"…", "anchors":{ "mode":"ticks", "E0":241,"E1":241,"E2":242,"E3":243 }, "deltas":{ "E0_E1_bind":{"ticks":0,"us":null}, "E1_E2_commit":{"ticks":1,"us":null}, "E2_E3_present":{"ticks":1,"us":null}, "E0_E3_total":{"ticks":2,"us":null} } }, "links":{ "txn_cert_id":"…", // if a state change occurred "present_frame_id":"…", // optional renderer frame intent id "haptics_pattern_id":"…" // if used (Slice 15) }, "classify":{ "bind":"ok","commit":"ok","present":"ok","total":"ok" } } 
+Rules:
+• action_id must be derivable by applying bindmap_id to the specific event (and axis quant rules) in events_id.
+• Anchors must be monotone: E0 ≤ E1 ≤ E2 ≤ E3.
+• present_frame_id identifies the first frame that includes the action’s visible effect (engine-provided intent marker, not GPU fence).
+9) Latency Certificate (input.cert.v1.0)
+Aggregates interactions over coverage, checks budgets, and records summary stats (deterministically).
+{ "schema":"input.cert.v1.0", "encoder_id":"…", "ds_registry_id":"…", "cert_id":"…", // §11 hashing "events_id":"…","bindmap_id":"…","budget_id":"…", "latency_ids":["…","…","…"], // ordered by E0 anchor "coverage":{"mode":"ticks","start":200,"end":400}, "assert":{ "events_covered": true, "anchors_monotone": true, "budgets_respected": true }, "stats":{ "by_action":{ "act_jump":{"count":120,"p50_ticks":1,"p95_ticks":2,"p99_ticks":2}, "act_cancel":{"count":30,"p50_ticks":2,"p95_ticks":3,"p99_ticks":3} }, "all":{"count":150,"p50_ticks":1,"p95_ticks":2,"p99_ticks":3} }, "quantiles":{ "method":"R7", // fixed quantile definition (Type 7) "ties":"low" // deterministic tie-breaking } } 
+Rules:
+• events_covered: every event in events_id that should bind (per bindmap.rules) within coverage must have a corresponding latency record (others may be ignored—e.g., axis drift inside deadzone).
+• Quantiles are computed deterministically with a fixed method (R7) on integer ticks; if using us, round-half-up to integers before quantiles.
+• budgets_respected is true only if all bound interactions meet both global and per-action budgets per segment, with the classify policy applied.
+10) Purity & Guardrails
+• No wall time: only ticks or run-relative us.
+• No network or RNG in capture/bind.
+• No gating: budgets cannot block execution; they classify evidence only.
+• No hidden smoothing: axis filtering must be exactly what the Binding Map states.
+• Stable device normalization: codes must reflect the same logical layout as Gamepad Map (Slice 9). Divergence ⇒ ILB_E_DEV_MAP.
+11) Hashing & IDs (DSR-bound)
+• bindmap_id = H( P_input_bindmap || canonical(bindmap_json) ), tag immu.input.bindmap.v1.
+• profile_id = H( P_input_profile || canonical(profile_json) ), tag immu.input.profile.v1.
+• events_id = H( P_input_events || canonical(events_json) ), tag immu.input.events.v1.
+• budget_id = H( P_input_budget || canonical(budget_json) ), tag immu.input.budget.v1.
+• lat_id = H( P_input_latency || canonical(lat_json) ), tag immu.input.latency.v1.
+• cert_id = H( P_input_cert || canonical(cert_json) ), tag immu.input.cert.v1.
+All bytes canonical per encoder_id; multihash attestations per Crypto Policy encouraged for evt_set and quantile tables.
+12) Verification Procedure (acceptance)
+Given bindmap_id, profile_id, events_id, budget_id, {lat_id…}, cert_id:
+• Hash & DSR: recompute; suites OK.
+• Profile adherence: ensure events_id.profile_id matches; anchors match anchor.mode/quant. Else ILB_E_PROFILE.
+• Bind reproduction: For each event, re-apply bindmap (deadzone/edge/quant rules) → derive expected action_id or “no-bind”. For each bound event, ensure exactly one latency record citing that evt_id. Else ILB_E_BIND_SET.
+• Anchor monotonicity: For every latency record, ensure E0 ≤ E1 ≤ E2 ≤ E3; else ILB_E_ORDER.
+• Delta recompute: Recompute deltas; ensure equality with recorded; else ILB_E_DELTA.
+• Budget check: Compare deltas to global & per-action budgets; apply classify; if any hard_over, set budgets_respected=false.
+• Coverage: Ensure the certificate coverage bounds match the subset of events considered; ensure events_covered flag is correct.
+• Stats/quantiles: Deterministically recompute per-action and overall quantiles using declared method/rounding; ensure equality; else ILB_E_STATS.
+• Cross-links: If txn_cert_id or present_frame_id are present, ensure their anchors fall at E2 and E3 respectively; else ILB_E_LINK.
+Accept iff all pass; otherwise reject with a minimal witness.
+13) Deterministic Errors (reason names)
+• ILB_E_SCHEMA — unsupported schema.
+• ILB_E_ENCODER — non-canonical bytes.
+• ILB_E_DSR — unknown/missing DSR tag.
+• ILB_E_PROFILE — event log anchor/fields deviate from capture profile.
+• ILB_E_DEV_MAP — device normalization mismatch (layout divergence).
+• ILB_E_BIND_SET — missing/duplicate latency record for a bound event.
+• ILB_E_ORDER — anchors not monotone or outside coverage.
+• ILB_E_DELTA — recomputed deltas differ from recorded.
+• ILB_E_BUDGET — segment exceeds hard budget (used for record-level flagging).
+• ILB_E_STATS — stats/quantiles mismatch.
+• ILB_E_LINK — txn/present/haptics links inconsistent.
+• ILB_E_HASH — id mismatch after hashing.
+Each failure returns a minimal witness: (evt_id, action_id, segment, expected, actual).
+14) Golden Vectors (minimum set)
+Place under golden/input_latency/v1.0/:
+• BindMap-A: Buttons A/B; axes LX/LY quant 10 bits → bindmap_id.
+• Profile-A: Anchors in ticks; fields as listed → profile_id.
+• Events-A: Three events (A press at tick 241, B press at tick 244, LX edge at tick 300) → events_id with evt_set.
+• Budget-A: Global segments: 1/1/1 ticks; total 3; per-action: act_jump total 2 → budget_id.
+• Latency-A1: For A press → E0=241,E1=241,E2=242,E3=243 (deltas 0/1/1/2) class “ok” → lat_id.
+• Latency-A2: For B press → E0=244,E1=245,E2=246,E3=247 (deltas 1/1/1/3) total=3 “ok” → lat_id.
+• Cert-A: Covers ticks [240,248); events_covered=true, budgets respected, p50=1, p95=2, p99=3 → cert_id.
+• Fail-Order: Latency record with E2 < E1 → ILB_E_ORDER.
+• Fail-Budget: For act_jump, total=3 vs per-action max 2 → ILB_E_BUDGET and certificate budgets_respected=false.
+• Fail-Stats: Change p95 to 3 → ILB_E_STATS.
+Each vector includes canonical bytes hex, DSR preludes, and expected digests.
+15) Interaction with Other Planes
+• SDR & PCV: Use SDR to observe overload and postpone inputs (never drop); the SDR decision references PCV windows and remains semantics-inert.
+• Admission: Admission records can include a “UI context” and link to latency records to prove UI actions stayed within allowed effects.
+• Haptics: E3 may be bound to a haptics pattern anchor; certs cross-link for end-to-end input→haptics audits.
+• Heals: Event logs & latency records are CAS evidence and can be vacuumed; Heal Cert proves reachable set unchanged.
+• Godot/GDAP/EBC: ILB does not touch assets or exports; it only measures runtime behavior on relative clocks.
+16) What this does not change (stability)
+• No changes to interpreter/staged semantics, parity tuple, gas, capability lineage, OML lattice, or effects.
+• No wall-clock, network, or RNG dependencies.
+• No runtime gating based on budgets; ILB is observe-and-prove, not control.
+End of Slice 18.
+Say continue to proceed. Clean next slices that dovetail tightly:
+• Operator Console Evidence v1.0 (sealed loopback UX transcripts & allowlist provenance),
+• Signature Attestation v1.0 (offline signing that binds signatures to export artifacts), or
+• Touch/Pointer Profile v1.1 (privacy-safe XY capture with quantized grids & gesture binds).
+Slice 19 — Operator Console Evidence (OCE) v1.0 — Sealed Loopback UX & Allowlist Provenance
+(Fully expanded, single sealed module. Builds on Slices 1–18. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• Sealed Console Profile (loopback-only, tmux session policy, env cordon).
+• Sealed Console Session (who/what/where of a terminal session; no PII beyond fingerprints).
+• Sealed Transcript (exact bytes of I/O with redaction map and canonicalization).
+• Sealed Execset (binaries invoked, arguments policy, exit statuses, fingerprints).
+• Sealed Exposure Probe (ss/nmap-style loopback checks + config hashes).
+• Sealed Console Certificate (verifier-facing assertions & witnesses).
+Out-of-scope (deferred): live monitoring, keystroke biometrics, editor UI films, webcam/screen recordings.
+Depends on:
+• Session & Access Plane (Termux loopback, Slice 8).
+• Crypto Policy (Slice 10), EP packaging (Slice 9).
+• Heals (Slice 13) for vacuuming OCE blobs; SDR (Slice 12) for scheduling probes.
+• Canonical serialization (encoder_id).
+Stability note: OCE observes operator interaction. It never alters state semantics, parity, gas, capabilities, or policy.
+1) Purpose (one paragraph)
+You need auditable proof that operator interactions occurred within the sealed loopback boundary and only via an allowlisted toolchain, with reproducible transcripts that don’t leak secrets. OCE defines how to lock the console environment, record byte-accurate I/O deterministically (with explicit redactions), enumerate executed binaries with fingerprints, and prove—via exposure probes—that no external listeners or rogue tools were present.
+2) DSR tags (append-only)
+• immu.oce.profile.v1 — Console Profile.
+• immu.oce.session.v1 — Console Session.
+• immu.oce.xscript.v1 — Console Transcript.
+• immu.oce.execset.v1 — Executed Binary Set.
+• immu.oce.probe.v1 — Exposure Probe.
+• immu.oce.cert.v1 — Console Certificate.
+Publishing this slice implies a new ds_registry_id including these tags.
+3) Console Profile (oce.profile.v1.0)
+{ "schema":"oce.profile.v1.0", "encoder_id":"…", "ds_registry_id":"…", "profile_id":"…", "loopback":{ "ssh_bind":"127.0.0.1:2222", "unix_sock":"$PREFIX/var/run/ssh.sock", "no_ipv6_listen":true }, "tmux":{ "session_name":"sealed", "force_attach":true, "utf8":true, "term":"screen-256color", "cols":120,"rows":40 }, "env_cordon":{ "LANG":"C","LC_ALL":"C","TZ":"UTC", "SOURCE_DATE_EPOCH":"1731024000" }, "allowlist":[ {"bin":"immu","ver":"1.0.0","hash":"blake3:…"}, {"bin":"tmux","ver":"3.3a","hash":"blake3:…"}, {"bin":"busybox","ver":"1.36.1","hash":"blake3:…"}, {"bin":"rclone","ver":"1.67.0","hash":"blake3:…"}, {"bin":"openssl","ver":"3.2.1","hash":"blake3:…"}, {"bin":"ss","ver":"6.4","hash":"blake3:…"}, {"bin":"nmap","ver":"7.94","hash":"blake3:…"} ], "redaction":{ "patterns":[ {"name":"secret-env","regex":"(?i)(?:API_KEY|TOKEN)=[^\\s]+"}, {"name":"pem-block","regex":"-----BEGIN [^-]+-----[\\s\\S]*?-----END [^-]+-----"} ], "replacement":"⟦REDACTED⟧", "mode":"lossless-map" // record offsets + hash of removed bytes in a side map }, "xscript":{ "newline":"lf", // normalize \n "encoding":"utf8", "clock":"ticks", // run-relative, not wall clock "record_stderr":true, "record_exit_codes":true }, "probes":{ "ss_args":"-ltnp", "nmap_targets":["127.0.0.1"], "nmap_flags":"-sS -Pn -n --top-ports 50" } } 
+Rules:
+• All allowlist entries must be exact-match by path hash at runtime; symlink traversal allowed only if final target hash matches.
+• Redaction runs before hashing the transcript; removed bytes are stored as blake3 digests in a side map to keep structural verifiability.
+• TTY size & TERM fixed; resize events recorded explicitly if allowed (v1 default: fixed).
+4) Console Session (oce.session.v1.0)
+{ "schema":"oce.session.v1.0", "encoder_id":"…", "ds_registry_id":"…", "session_id":"…", "profile_id":"…", "tmux":{ "session":"sealed","server_hash":"blake3:…" }, "ssh":{ "bind":"127.0.0.1:2222","unix_sock":"$PREFIX/var/run/ssh.sock", "sshd_config_hash":"blake3:…" }, "services":[ {"name":"ssh-unix-gw","status":"up","run_file_hash":"blake3:…"}, {"name":"rclone-ca","status":"down"}, {"name":"seal-watch","status":"up"} ], "env_cordon":{"LANG":"C","LC_ALL":"C","TZ":"UTC","SOURCE_DATE_EPOCH":"1731024000"}, "anchor":{"mode":"ticks","start":0,"end":3600} } 
+Rules:
+• Service run scripts’ hashes must match the expected EP copies.
+• No external addresses permitted; bind must be loopback.
+5) Transcript (oce.xscript.v1.0)
+{ "schema":"oce.xscript.v1.0", "encoder_id":"…", "ds_registry_id":"…", "xscript_id":"…", "session_id":"…", "profile_id":"…", "chan":["stdin","stdout","stderr"], "records":[ {"t":101,"chan":"stdin","bytes_b64":"bWtkaXIgLWsgY2FzCg=="}, {"t":102,"chan":"stdout","bytes_b64":"ZG9uZQo="} ], "redactions":[ {"offset":2048,"len":128,"pattern":"pem-block","digest":"blake3:…"} ], "digests":{ "raw_stream":"blake3:…", // before redaction "canon_stream":"blake3:…" // after redaction + newline normalization } } 
+Rules:
+• t is a run-relative tick or integer microseconds; monotonically non-decreasing.
+• Records are in-order; canon_stream is over normalized, redacted concatenation with explicit channel markers (⟦stdout⟧, etc.) per canonical encoder rules.
+• If redaction occurs, the raw_stream digest must be present; raw bytes are not stored in EP—only their digest and redaction map (to preserve privacy while still proving structure).
+6) Execset (oce.execset.v1.0)
+{ "schema":"oce.execset.v1.0", "encoder_id":"…", "ds_registry_id":"…", "execset_id":"…", "session_id":"…", "allowlist_id":"…", // embedded or referenced from profile "entries":[ { "when_t":110, "exe":"immu", "argv":["immu","root"], "cwd":"~/.immutable-stack/", "env_subset":{"LANG":"C","TZ":"UTC"}, "bin_hash":"blake3:…", "exit":0,"dur_ticks":2, "iobytes":{"stdin":0,"stdout":66,"stderr":0}, "via":"tmux-pane-0" } ], "digests":{"exe_set":"blake3:…"} } 
+Rules:
+• Every exe must match an allowlist item by hash (not just name).
+• Arguments are captured exactly; redaction applies to argv/env via the same redaction.patterns.
+• Exit and durations are run-relative; no wall-clock timestamps.
+7) Exposure Probe (oce.probe.v1.0)
+{ "schema":"oce.probe.v1.0", "encoder_id":"…", "ds_registry_id":"…", "probe_id":"…", "session_id":"…", "checks":{ "ss":{"cmd":"ss -ltnp","stdout":"blake3:…","parsed":[ {"proto":"tcp","local":"127.0.0.1:2222","proc":"sshd"}, {"proto":"tcp","local":"127.0.0.1:8080","proc":"tmux"} ]}, "nmap":{"targets":["127.0.0.1"],"stdout":"blake3:…","ports":[2222]}, "configs":{ "sshd_config_hash":"blake3:…", "service_run_hashes":["blake3:…","blake3:…"] } }, "assert":{ "no_external_listen": true, "loopback_ports_subset": true } } 
+Rules:
+• no_external_listen requires: no listen addresses other than 127.0.0.1 (and ::1 if IPv6 loopback allowed).
+• loopback_ports_subset means discovered loopback ports are a subset of the profile-declared set.
+• Raw outputs are hashed; parsers are deterministic and included in EP code hash if needed.
+8) Console Certificate (oce.cert.v1.0)
+{ "schema":"oce.cert.v1.0", "encoder_id":"…", "ds_registry_id":"…", "cert_id":"…", "profile_id":"…", "session_id":"…", "xscript_id":"…", "execset_id":"…", "probe_id":"…", "assert":{ "env_cordon_ok": true, "allowlist_honored": true, "redactions_only_patterns": true, "transcript_canonical": true, "no_external_exposure": true }, "witness":{ "raw_stream":"blake3:…", "canon_stream":"blake3:…", "exe_set":"blake3:…", "allowed_bins":["immu","tmux","busybox","ss","nmap"] }, "notes":"Console interactions confined to loopback; allowlist exact-match by hash" } 
+Rules:
+• allowlist_honored is true only if every execset entry’s bin_hash equals one allowlist hash, and no non-allowlisted exe appears.
+• redactions_only_patterns requires all removed spans to match declared regexes; otherwise OCE_E_REDACT_RX.
+• transcript_canonical ensures newline normalization, UTF-8 valid, channel markers inserted per spec; recomputed canon_stream must match.
+9) Hashing & IDs (DSR-bound)
+• profile_id = H( P_oce_profile || canonical(profile_json) ), tag immu.oce.profile.v1.
+• session_id = H( P_oce_session || canonical(session_json) ), tag immu.oce.session.v1.
+• xscript_id = H( P_oce_xscript || canonical(xscript_json) ), tag immu.oce.xscript.v1.
+• execset_id = H( P_oce_execset || canonical(execset_json) ), tag immu.oce.execset.v1.
+• probe_id = H( P_oce_probe || canonical(probe_json) ), tag immu.oce.probe.v1.
+• cert_id = H( P_oce_cert || canonical(cert_json) ), tag immu.oce.cert.v1.
+All bytes are canonical per encoder_id; multihash attestations recommended for streams and allowlist tables.
+10) Verification procedure (acceptance)
+Given profile_id, session_id, xscript_id, execset_id, probe_id, cert_id:
+• Hash/DSR: recompute; suites per Crypto Policy.
+• Profile adherence: env cordon equal; tmux & loopback params equal (OCE_E_PROFILE).
+• Transcript: recompute canon_stream (apply declared redactions, normalize newlines/encoding, insert channel markers) and compare; ensure raw_stream digest matches if provided (OCE_E_XSCRIPT).
+• Redactions: every redaction span must match at least one regex; else OCE_E_REDACT_RX.
+• Execset: re-hash binaries on disk (if available) or trust recorded bin_hash within EP; check each against allowlist; check argv/env redaction; ensure exit statuses present (OCE_E_EXECSET).
+• Probe: parse ss/nmap digests deterministically; assert no_external_listen and loopback_ports_subset; confirm config hashes equal (OCE_E_PROBE).
+• Certificate assertions: recompute booleans; mismatch ⇒ OCE_E_CERT_ASSERT.
+Accept iff all pass; else provide minimal witness (first offending record/port/bin hash/span).
+11) Deterministic errors (reason names)
+• OCE_E_SCHEMA — unsupported schema.
+• OCE_E_ENCODER — non-canonical bytes.
+• OCE_E_DSR — missing/unknown DSR tag.
+• OCE_E_PROFILE — env cordon or loopback/tmux policy mismatch.
+• OCE_E_XSCRIPT — transcript digest/ordering mismatch.
+• OCE_E_REDACT_RX — redaction span not explained by allowed patterns.
+• OCE_E_EXECSET — non-allowlisted binary or hash/version mismatch.
+• OCE_E_PROBE — external listener or unexpected loopback port; config hash mismatch.
+• OCE_E_CERT_ASSERT — asserted flags not satisfied.
+• OCE_E_HASH — id mismatch after hashing.
+12) Golden vectors (minimum set)
+Place under golden/oce/v1.0/:
+• Profile-A: Loopback ssh 127.0.0.1:2222, tmux sealed, env cordon set → profile_id.
+• Session-A: Services up; sshd_config hash; run script hashes → session_id.
+• Xscript-A: Small stdin/stdout exchange; one PEM redaction; digests provided → xscript_id.
+• Execset-A: immu root and ss -ltnp; hashes match allowlist; exits 0 → execset_id.
+• Probe-A: ss shows loopback-only; nmap sees port 2222; asserts true → probe_id.
+• Cert-A: All assertions true → cert_id.
+• Fail-Execset: Replace immu hash with off-allowlist → OCE_E_EXECSET.
+• Fail-Probe: Add 0.0.0.0:8080 listener in parsed ss → OCE_E_PROBE.
+• Fail-Redact: Insert a secret string not matching patterns but redacted → OCE_E_REDACT_RX.
+• Fail-Xscript: Change newline normalization → OCE_E_XSCRIPT.
+Vectors include canonical bytes hex, DSR preludes, and expected digests.
+13) Interaction with other planes
+• Session & Access Plane (Slice 8): OCE proves the loopback boundary claimed there (ss/nmap + config hashes).
+• EP (Slice 9): OCE artifacts live under evidence/runs/session/…; no-exposure.*.run.json becomes a formal Probe + Certificate.
+• Heals (Slice 13): OCE blobs can be vacuumed; Heal Cert ensures reachable sets unchanged.
+• SDR (Slice 12): Probes can be scheduled (e.g., on session start/end) with SDR decisions; semantics remain inert.
+• PCV (Slice 11): You may correlate console activity to power/thermal windows (evidence-only).
+• GDAP/EBC/ILB: Orthogonal; transcripts can reference export or latency anchors for full operator→artifact provenance.
+14) What this does not change (stability)
+• No changes to interpreter/staged semantics, parity tuple, gas model, capability lineage, OML lattice, or effects.
+• No network or wall-clock dependencies; all anchors are run-relative; external data are hashed as opaque bytestreams.
+• No operator PII beyond tool fingerprints and hashed outputs; secrets are redacted with explicit witness maps.
+End of Slice 19.
+Say continue to proceed. Tight next slices that interlock cleanly:
+• Signature Attestation v1.0 (offline signing that binds signatures to artifacts & manifests),
+• Touch/Pointer Profile v1.1 (privacy-safe XY grids & gesture binds), or
+• Coverage Ledger v1.0 (EP-wide index mapping artifacts → witnesses → certs for one-pass audits).
+
+Slice 20 — Signature Attestation (SIG) v1.0 — Offline, Deterministic Signing of Artifacts & Manifests
+(Fully expanded, single sealed module. Builds on Slices 1–19. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• Sealed Keyring (allowed signers, revocations, threshold policy).
+• Sealed Sign Profile (algorithm set, message layout, domain separation, env cordon).
+• Sealed Sign Request (what exactly is being signed).
+• Sealed Sign Run (how the signature(s) were produced, tool hashes).
+• Sealed Signature Object (bytes + metadata).
+• Sealed Signature Bundle (1..N signatures + threshold witness).
+• Sealed Signature Certificate (verifier-facing assertions & witnesses).
+Out-of-scope (deferred): timestamp authorities / notary services; X.509 chain validation; in-band artifact mutation (signatures are detached).
+Depends on:
+• Crypto Policy v1.0 (Slice 10) — hash suites & multihash attestations.
+• EBC v1.0 (Slice 17) — typical sign targets (artifact.digest, entry_set_manifest).
+• Upgrade Plane (Slice 6) — can adopt Signature Bundles for upgrade keys.
+• OCE v1.0 (Slice 19) — optional: record signing console transcripts.
+• Canonical serialization (encoder_id).
+Stability note: SIG is evidence-only; it never alters program semantics or parity. All messages are sealed and reproducible offline.
+1) Purpose (one paragraph)
+You need portable, verifiable signatures over exact bytes (e.g., export bundle digests, manifests) that anyone can check offline with zero ambiguity. SIG v1.0 fixes (1) who may sign (Keyring), (2) exactly what is signed (Sign Request), (3) how to serialize & domain-separate the message (Sign Profile), and (4) a threshold-aware bundle + certificate so verifiers can prove “M-of-N valid signatures over this digest” with no clocks, no network, and no tool drift.
+2) DSR tags (append-only)
+• immu.sig.keyring.v1 — Keyring & threshold policy.
+• immu.sig.profile.v1 — Sign Profile (algorithms, message layout).
+• immu.sig.request.v1 — Sign Request (the to-be-signed message).
+• immu.sig.run.v1 — Sign Run (tool hashes, env cordon).
+• immu.sig.sig.v1 — Signature Object (one key → one sig).
+• immu.sig.bundle.v1 — Signature Bundle (set + threshold witness).
+• immu.sig.cert.v1 — Signature Certificate (verifier-facing).
+Publishing this slice implies a new ds_registry_id that includes these tags.
+3) Keyring (sig.keyring.v1.0)
+{ "schema":"sig.keyring.v1.0", "encoder_id":"…", "ds_registry_id":"…", "keyring_id":"…", // §12 hashing "signers":[ { "kid":"ed25519:Z3n…", // canonical KID (see below) "alg":"ed25519", "pubkey_b64":"MC4CAQAwBQYDK2VwAyEA…", "labels":["release","export"], "revoked":false } ], "threshold":{"m":2,"n":3,"scope":["export","upgrade"]}, "revocations":[ // append-only, content-addressed {"kid":"…","reason":"key_compromise","at_seq":7} ], "notes":"M-of-N policy; KID = H(\"kid:\" || raw_pubkey)" } 
+Rules (normative):
+• KID derivation: kid = "ed25519:" || b32(H(pubkey_raw_bytes)) with H=BLAKE3-256.
+• Allowed alg in v1.0: 
+• ed25519 (pure Ed25519 over message bytes; preferred),
+• ecdsa-p256-rfc6979 (SHA-256 prehash; deterministic k via RFC 6979).
+(RSA-PSS is excluded in v1.0 due to randomized salt; RSA-PKCS1v1_5 may be added in v1.1 behind policy gates.)
+• threshold.m ≤ threshold.n == |signers|.
+• Revocations are monotone; no wall-clock. Use a keyring sequence (at_seq) to order updates.
+4) Sign Profile (sig.profile.v1.0)
+{ "schema":"sig.profile.v1.0", "encoder_id":"…", "ds_registry_id":"…", "profile_id":"…", "keyring_id":"…", "algorithms":["ed25519"], // subset of keyring algs "domain_tag":"IMMUTABLE::SIG::EBC.v1", // domain separation label "message_layout":{ "fields":["artifact_digest","entry_set_manifest","context_note"], "hash_before_sign":false // ed25519 signs raw canonical bytes }, "env_cordon":{"LANG":"C","TZ":"UTC","LC_ALL":"C","SOURCE_DATE_EPOCH":"1731024000"}, "forbid_fields":["timestamp","hostname","username"], // no ambient IDs "notes":"Detached, domain-separated, timestamp-free" } 
+Rules:
+• domain_tag must be prepended to the canonical message bytes before signing.
+• If algorithms includes ecdsa-p256-rfc6979, the profile must set hash_before_sign:true with SHA-256.
+• Forbid any ambient identity or clocks; signatures are portable across time/hosts.
+5) Sign Request (sig.request.v1.0)
+{ "schema":"sig.request.v1.0", "encoder_id":"…", "ds_registry_id":"…", "request_id":"…", // §12 hashing "profile_id":"…","keyring_id":"…", "message":{ "artifact_id":"…", // ebc.artifact.v1.0 id (optional but recommended) "artifact_digest":"blake3:…", "entry_set_manifest":"blake3:…", "context_note":"release:alpha-2025-11-08" // free text; not a clock } } 
+Rules:
+• message is canonicalized exactly as per message_layout.
+• At minimum, one stable digest field (e.g., artifact_digest) is required.
+6) Sign Run (sig.run.v1.0)
+{ "schema":"sig.run.v1.0", "encoder_id":"…", "ds_registry_id":"…", "run_id":"…", "request_id":"…", "toolchain":{ "signer_bin":{"name":"openssl|age|minisign|ssh-keygen","ver":"…","sha":"blake3:…"}, "env":{"LANG":"C","TZ":"UTC","LC_ALL":"C","SOURCE_DATE_EPOCH":"1731024000"} }, "used_keys":[{"kid":"…","alg":"ed25519"}], "dur_s":0.02 } 
+Rules:
+• Offline: no network; env cordon must match Sign Profile.
+• used_keys.kid must exist in the Keyring and not be revoked at the current keyring sequence.
+7) Signature Object (sig.sig.v1.0)
+{ "schema":"sig.sig.v1.0", "encoder_id":"…", "ds_registry_id":"…", "sig_id":"…", // §12 hashing "request_id":"…","profile_id":"…","run_id":"…","keyring_id":"…", "kid":"…","alg":"ed25519", "domain_tag":"IMMUTABLE::SIG::EBC.v1", "message_digest":"blake3:…", // digest of canonical message bytes (with domain tag) "signature_b64":"ZpX…", // raw signature bytes "pubkey_b64":"MC4CAQAwBQYDK2VwAyEA…" } 
+Rules:
+• message_digest is always present (even if hash_before_sign=false) for quick equality checks.
+• pubkey_b64 must equal the Keyring public key for kid; verifiers will recompute the kid and compare.
+8) Signature Bundle (sig.bundle.v1.0)
+{ "schema":"sig.bundle.v1.0", "encoder_id":"…", "ds_registry_id":"…", "bundle_id":"…", // §12 hashing "request_id":"…","profile_id":"…","keyring_id":"…", "sig_ids":["…","…","…"], // 1..N "threshold":{"m":2,"n":3}, "witness":{"satisfied":true,"used":["kidA","kidB"]} } 
+Rules:
+• threshold must equal the Keyring threshold at the referenced sequence.
+• witness.used lists the minimal subset that satisfied m.
+• All sig_ids[*] must refer to signatures over the same request_id and message_digest.
+9) Signature Certificate (sig.cert.v1.0)
+Verifier-facing assertions & witnesses.
+{ "schema":"sig.cert.v1.0", "encoder_id":"…", "ds_registry_id":"…", "cert_id":"…", "keyring_id":"…","profile_id":"…","request_id":"…","bundle_id":"…", "assert":{ "keyring_coherent": true, "profile_respected": true, "message_digest_matches": true, "threshold_satisfied": true, "all_sigs_valid": true }, "witness":{ "artifact_digest":"blake3:…", "entry_set_manifest":"blake3:…", "domain_tag":"IMMUTABLE::SIG::EBC.v1", "used_kids":["kidA","kidB"] }, "notes":"M-of-N satisfied with ed25519; detached signatures" } 
+Rules:
+• Verifier reconstructs the canonical message from request_id, prepends domain_tag, computes message_digest, and verifies each signature under its kid.
+• threshold_satisfied only true if ≥m signatures validate from non-revoked keys present in the Keyring.
+10) Deterministic algorithm rules (normative)
+• Domain separation (required): The exact string domain_tag must prefix the canonical message bytes:
+to_sign = ASCII(domain_tag) || 0x00 || canonical(message) (0x00 separator).
+• Canonical bytes: Sorted keys, UTF-8, no whitespace, fixed numeric formats (per your canonical encoder).
+• ed25519: sign to_sign directly (no additional prehash).
+• ecdsa-p256-rfc6979: compute SHA-256(to_sign), sign with RFC 6979 deterministic k.
+• No timestamps, no host IDs, no random salt.
+• Multiple suites: If Crypto Policy requires dual-suite support, include both blake3 and sha256 of to_sign inside the Signature Object as optional digests:{blake3:…,sha256:…}.
+11) Purity & Guardrails
+• Offline: verification & signing must succeed without network.
+• Detached: artifacts are never mutated to “embed” signatures.
+• Revocation: purely keyring-sequence based; no wall-clock validity.
+• Key hygiene: private keys never appear in EP; only public material and KIDs.
+• Tool neutrality: signatures verify regardless of which compliant tool produced them, as long as bytes & alg match.
+12) Hashing & IDs (DSR-bound)
+• keyring_id = H(P_sig_keyring || canonical(keyring_json)), tag immu.sig.keyring.v1.
+• profile_id = H(P_sig_profile || canonical(profile_json)), tag immu.sig.profile.v1.
+• request_id = H(P_sig_request || canonical(request_json)), tag immu.sig.request.v1.
+• run_id = H(P_sig_run || canonical(run_json)), tag immu.sig.run.v1.
+• sig_id = H(P_sig_sig || canonical(sig_json)), tag immu.sig.sig.v1.
+• bundle_id = H(P_sig_bundle || canonical(bundle_json)), tag immu.sig.bundle.v1.
+• cert_id = H(P_sig_cert || canonical(cert_json)), tag immu.sig.cert.v1.
+All bytes canonical per encoder_id; optional multihash fields satisfy Crypto Policy dual-suite requirements.
+13) Verification procedure (acceptance)
+Given keyring_id, profile_id, request_id, {sig_id…}, bundle_id, cert_id:
+• Hash/DSR: recompute all IDs; suites OK.
+• Keyring sanity: Non-revoked subset equals threshold.n signers; KIDs match pubkeys; algorithms allowed. Else SIG_E_KEYRING.
+• Profile adherence: Algorithms used ⊆ profile.algorithms; env cordon matches Sign Run; forbid_fields absent. Else SIG_E_PROFILE.
+• Message reconstruction: Canonicalize request.message, apply domain_tag, compute message_digest (both blake3 and sha256 if present). Else SIG_E_MESSAGE.
+• Per-sig verification: For each sig_id, recompute KID from pubkey_b64, verify against message_digest with declared alg. Else SIG_E_VERIFY.
+• Bundle check: All sig_ids refer to the same (request_id, profile_id); count valid signatures from non-revoked KIDs; ensure ≥m. Else SIG_E_THRESH.
+• Certificate re-compute: Rebuild assert.* booleans; mismatch ⇒ SIG_E_CERT_ASSERT.
+Accept iff all pass; otherwise reject with a minimal witness (first failing kid, digest pair, or count).
+14) Deterministic errors (reason names)
+• SIG_E_SCHEMA — unsupported schema (keyring/profile/request/run/sig/bundle/cert).
+• SIG_E_ENCODER — non-canonical encoding.
+• SIG_E_DSR — unknown/missing DSR tag.
+• SIG_E_KEYRING — bad KID/pubkey, unsupported alg, or revocation/sequence conflict.
+• SIG_E_PROFILE — disallowed algorithm or forbidden field present.
+• SIG_E_MESSAGE — message canonicalization/domain-tag mismatch.
+• SIG_E_VERIFY — signature invalid under pubkey/algo.
+• SIG_E_THRESH — threshold not satisfied.
+• SIG_E_CERT_ASSERT — asserted flags not satisfied.
+• SIG_E_HASH — id mismatch after hashing.
+Each error includes a minimal witness (KID, index, computed vs recorded digest).
+15) Golden vectors (minimum set)
+Place under golden/sig/v1.0/:
+• Keyring-A: 3 Ed25519 signers (kidA/B/C), threshold 2-of-3 → keyring_id.
+• Profile-A: algorithms:["ed25519"], domain IMMUTABLE::SIG::EBC.v1, forbid timestamps → profile_id.
+• Request-A: artifact_digest=blake3:…, entry_set_manifest=blake3:… → request_id.
+• Run-A: Toolchain minisign (or ssh-keygen -Y sign) with env cordon → run_id.
+• Sig-A1/A2: Valid signatures from kidA and kidB → sig_ids.
+• Bundle-A: Includes A1,A2 with witness satisfied → bundle_id.
+• Cert-A: Asserts all true → cert_id.
+• Fail-Verify: Flip one byte of signature → SIG_E_VERIFY.
+• Fail-Threshold: Provide only one valid sig → SIG_E_THRESH.
+• Fail-Message: Change domain_tag in profile → SIG_E_MESSAGE.
+• Fail-Profile: Add timestamp field to message → SIG_E_PROFILE.
+Each vector includes canonical bytes hex and expected digests.
+16) Interaction with other planes
+• EBC (Slice 17): Sign artifact.digest and/or entry_set_manifest; attach bundle_id to release notes in EP.
+• Upgrade (Slice 6): Replace ad-hoc openssl usage with SIG bundles; roll keyring sequences for rotations.
+• OCE (Slice 19): Record the signing session; prove allowlist of signing tools.
+• Heals (Slice 13): SIG objects are CAS blobs; vacuum safe with Heal Cert.
+• Admission (Slice 16): Signing writes should map to mem.cache effect class if recorded; admission witnesses remain valid.
+17) What this does not change (stability)
+• No changes to interpreter/staged semantics, gas, capability lineage, OML algebra, or parity tuple.
+• No reliance on wall clocks, network, or host identity.
+• No in-place artifact mutation; signatures are detached and fully reproducible.
+End of Slice 20.
+Say continue to proceed. Next tight candidates:
+• Touch/Pointer Profile v1.1 (privacy-safe XY grids & gesture binds),
+• Coverage Ledger v1.0 (EP-wide index mapping artifacts → witnesses → certs for one-pass audits), or
+• Thermal Budget v1.0 (policy-safe throttling envelopes linked to Admission & PCV).
+Slice 21 — Touch/Pointer Profile v1.1 — Privacy-Safe XY Capture & Deterministic Gesture Binds
+(Fully expanded, single sealed module. Builds on Slices 1–20. You hold the gate.)
+0) Scope & Dependencies
+In-scope:
+• Sealed Touch Device Capabilities (normalized pointer types & limits).
+• Sealed Touch Profile (XY grid, quantization, masks, anchors, rate limits).
+• Sealed Touch Events (quantized, privacy-safe, run-relative).
+• Sealed Gesture Map (deterministic recognition thresholds, bind rules).
+• Sealed Touch Tracks (per-pointer trajectories with derived features).
+• Sealed Gesture Records (recognized gestures with anchors & parameters).
+• Sealed Touch Certificate (verifier-facing assertions & witnesses).
+Out-of-scope (deferred): raw images/videos; face/biometric inference; OS-specific precision pointer heuristics. No online analytics. No wall-clock.
+Depends on:
+• ILB v1.0 (Slice 18) — actions/latency anchors; we add pointer sources.
+• Gamepad Map v1.0 (Slice 9) — analogous normalization (namespaces differ).
+• Admission v1.0 (Slice 16) — optional per-window policy for input capture.
+• OCE v1.0 (Slice 19) — console provenance (not mandatory here).
+• Canonical serialization (encoder_id) & Crypto Policy (Slice 10).
+Stability note: This slice is evidence-only; it does not alter program semantics or parity. All timing uses run-relative ticks/us.
+1) Purpose (one paragraph)
+Pointer/touch input often leaks fine-grained user traces (PII) and drifts with device DPI, OS smoothing, and clocks. v1.1 fixes capture by (1) normalizing devices & pointer kinds, (2) quantizing XY to a coarse, sealed grid, (3) bounding rate & fields for privacy, (4) recognizing gestures with a deterministic FSM and run-relative thresholds, and (5) binding gestures to actions for ILB—so any verifier can reproduce the same tracks, the same gestures, and the same action binds offline, without ever seeing raw coordinates.
+2) DSR Tags (append-only)
+• immu.touch.caps.v1 — Touch/Pointer Capabilities.
+• immu.touch.profile.v1 — Touch Profile (grid, masks, anchors).
+• immu.touch.events.v1 — Touch Events (quantized).
+• immu.touch.tracks.v1 — Touch Tracks (per-pointer features).
+• immu.touch.gmap.v1 — Gesture Map (thresholds, binds).
+• immu.touch.gest.v1 — Gesture Records (recognized gestures).
+• immu.touch.cert.v1 — Touch Certificate (verifier-facing).
+Publishing this slice implies a new ds_registry_id that includes these tags.
+3) Device Capabilities (touch.caps.v1.1)
+{ "schema":"touch.caps.v1.1", "encoder_id":"…", "ds_registry_id":"…", "tcaps_id":"…", "device":{"kind":"touch|mouse|pen|unknown","name_hash":"blake3:…"}, "limits":{ "max_points":10, "pressure_range":[0.0,1.0], "tilt_supported":false, "wheel_supported":true }, "norm":{ "dpi":"logical", // coordinates expressed in viewport units "viewport_ref":{"width_vu":1920,"height_vu":1080} // virtual units (VU) } } 
+Rules:
+• name_hash is a hash of a non-PII model string (e.g., vendor/model) if available; otherwise "unknown".
+• All downstream coordinates are in viewport units (VU)—a sealed logical space decoupled from physical DPI.
+4) Touch Profile (touch.profile.v1.1)
+{ "schema":"touch.profile.v1.1", "encoder_id":"…", "ds_registry_id":"…", "tprof_id":"…", // §12 hashing "tcaps_id":"…", "anchor":{"mode":"ticks|seconds","quant":"ticks|us","ticks_per_frame":1}, "grid":{ "cols": 64, "rows": 36, // coarse grid for privacy "origin":"top_left", "snap":"round", // round|floor|ceil "cell_vu":{"w":30,"h":30} // optional; redundant with cols/rows if set }, "privacy":{ "max_rate_hz":120, // per pointer id after quantization "max_move_per_tick_cells":4, "pressure_bits":0, // 0 = drop; else 8/10/12-bit fixed "tilt_enable":false, "hash_raw_xy":true // store H(path_raw_bytes) only }, "masks":[ {"rect":{"x0c":20,"y0r":10,"x1c":43,"y1r":25},"policy":"omit"} // cell coords ], "wheel":{ "unit":"lines","quant":1 // wheel steps quantization }, "notes":"Coarse grid reduces re-identification risk; masks omit sensitive UI" } 
+Rules:
+• cols×rows must tile the viewport_ref (from tcaps.norm); if cell_vu set, it must imply the same grid.
+• Masks in cell coordinates (not pixels) remove events entering masked cells (policy:"omit") or map them to a sentinel (policy:"zero")—v1.1 uses omit.
+• pressure_bits=0 drops pressure; otherwise quantize to fixed bits (unsigned).
+• No XY is stored in raw form; hash_raw_xy:true keeps a path digest for integrity without PII.
+5) Touch Events (touch.events.v1.1)
+{ "schema":"touch.events.v1.1", "encoder_id":"…", "ds_registry_id":"…", "tevt_id":"…", "tprof_id":"…","tcaps_id":"…", "coverage":{"mode":"ticks","start":0,"end":600}, "events":[ { "evt_id":"…", "pointer_id":1, // stable per-contact until UP "kind":"touch|mouse|pen", "type":"down|move|up|enter|leave|wheel", "cell":{"c":31,"r":18}, // quantized grid cell "value":{"wheel_steps":1}, // or {"pressure_q":128} "anchor":{"tick":241}, // or {"us":…} "qseq":1001 // per-device monotone queue seq } ], "digests":{"evt_set":"blake3:…","raw_path":"blake3:…"} // if enabled } 
+Rules:
+• events sorted by (anchor, qseq, pointer_id).
+• enter/leave for hover devices; wheel allowed for mouse.
+• Any event falling in a masked cell is omitted (preserves privacy and determinism).
+• Moves exceeding max_move_per_tick_cells are split into Bresenham-like interpolated cell steps at the same anchor (deterministic path filling), bounded by max_rate_hz.
+6) Touch Tracks (touch.tracks.v1.1)
+Per-pointer contact segments (DOWN…UP), with derived features used by gesture FSM.
+{ "schema":"touch.tracks.v1.1", "encoder_id":"…", "ds_registry_id":"…", "ttrk_id":"…", "tevt_id":"…","tprof_id":"…", "tracks":[ { "pointer_id":1, "start_tick":241,"end_tick":260, "cells":[{"c":31,"r":18},{"c":31,"r":18},{"c":32,"r":18}], "len_cells":2, // Manhattan path length "bbox":{"cmin":31,"cmax":32,"rmin":18,"rmax":18}, "dur_ticks":19 } ], "digests":{"track_set":"blake3:…"} } 
+Rules:
+• Tracks are maximal contiguous segments from down to up for the same pointer_id.
+• len_cells is computed after path interpolation (if applied).
+• No unmasked XY beyond cell indices is present.
+7) Gesture Map (touch.gmap.v1.1)
+Deterministic recognition thresholds & binds from tracks to Action IDs (ILB).
+{ "schema":"touch.gmap.v1.1", "encoder_id":"…", "ds_registry_id":"…", "gmap_id":"…", "tprof_id":"…", "anchors":{"mode":"ticks|seconds","quant":"ticks|us"}, "thresholds":{ "tap":{"max_len_cells":1,"max_dur_ticks":20}, "double_tap":{"gap_ticks":[10,40]}, // inclusive window "long_press":{"min_dur_ticks":60,"max_len_cells":1}, "swipe":{"min_len_cells":6,"max_dur_ticks":30}, "pinch":{"min_pairs":2,"min_scale_q8":230,"max_scale_q8":280}, // 256 = 1.0 "rotate":{"min_pairs":2,"min_deg":15} }, "quant":{ "scale_bits":8, // Q8.8 fixed (but here 8 fractional) "angle_deg_step":1 }, "binds":[ {"gesture":"tap","target":"single","action":"act_select"}, {"gesture":"double_tap","target":"single","action":"act_open"}, {"gesture":"swipe","target":"dir:right","action":"act_next"}, {"gesture":"swipe","target":"dir:left","action":"act_prev"}, {"gesture":"pinch","target":"scale:in","action":"act_zoom_in"}, {"gesture":"pinch","target":"scale:out","action":"act_zoom_out"} ], "notes":"FSM recognition uses grid cells & ticks only; no wall-clock" } 
+Rules:
+• FSM recognition (normative): 
+• tap: len_cells ≤ max_len_cells ∧ dur_ticks ≤ max_dur_ticks.
+• double_tap: two taps with inter-tap gap in gap_ticks.
+• long_press: dur_ticks ≥ min_dur_ticks ∧ len_cells ≤ max_len_cells.
+• swipe: len_cells ≥ min_len_cells ∧ dur_ticks ≤ max_dur_ticks, direction = argmax of axis travel (|Δc| vs |Δr|) with tie break lexicographically (right>left>down>up).
+• pinch/rotate: pairwise analysis over concurrent tracks; scale ratio quantized to scale_bits; rotation quantized to angle_deg_step.
+• binds[*].target disambiguates variants: single, dir:(left|right|up|down), scale:(in|out).
+8) Gesture Records (touch.gest.v1.1)
+Recognized gestures, anchors, parameters, and the action they bind to (for ILB).
+{ "schema":"touch.gest.v1.1", "encoder_id":"…", "ds_registry_id":"…", "gact_id":"…", "gmap_id":"…","ttrk_id":"…", "gestures":[ { "gid":"…", "kind":"tap|double_tap|long_press|swipe|pinch|rotate", "pointers":[1], // or [1,2] for multi-touch "anchors":{"start_tick":241,"end_tick":260}, "params":{"dir":"right","len_cells":7}, // or {"scale_q8":272} "action_id":"…" } ], "digests":{"gest_set":"blake3:…"} } 
+Rules:
+• action_id = H("act:" || action) as in ILB BindMap; ILB may reference gact_id as the source for E0/E1 anchors.
+• anchors.start_tick = first contributing track start; end_tick = last contributing track end.
+9) Touch Certificate (touch.cert.v1.1)
+Verifier-facing checks across capture → tracks → gestures → binds.
+{ "schema":"touch.cert.v1.1", "encoder_id":"…", "ds_registry_id":"…", "tcert_id":"…", "tcaps_id":"…","tprof_id":"…","tevt_id":"…","ttrk_id":"…","gmap_id":"…","gact_id":"…", "assert":{ "profile_respected": true, "privacy_enforced": true, "tracks_complete": true, "gestures_deterministic": true, "binds_resolved": true }, "witness":{ "evt_set":"blake3:…", "track_set":"blake3:…", "gest_set":"blake3:…", "grid":{"cols":64,"rows":36} }, "notes":"All gestures derived via FSM; masks applied; no raw XY stored" } 
+Rules:
+• privacy_enforced only true if: (a) no event falls in masked cells, (b) pressure/tilt follow profile, (c) rates not exceeding max_rate_hz, and (d) hash_raw_xy present if enabled.
+• tracks_complete: every down has a matching up (except hover), and all intermediate moves exist (after interpolation).
+• gestures_deterministic: recomputation from tracks and gmap yields identical gestures[].
+• binds_resolved: each gesture maps to exactly one action_id per binds rules.
+10) Purity & Guardrails
+• Run-relative anchors only; no wall clocks or OS timestamps.
+• No OS gesture recognizers; only the sealed FSM with declared thresholds.
+• No per-device heuristics beyond tcaps & grid; dpi/OS smoothing ignored.
+• No PII: no raw XY stored; only grid cells and optional raw_path digest.
+• Deterministic tie-breakers (direction, double-tap matching, overlap): lexicographic and documented above.
+11) Interaction with ILB (Slice 18)
+• ILB E0 can use the gesture start (anchors.start_tick) instead of raw event when actions originate from gestures.
+• ILB action_bind (E1) occurs when gact_id yields action_id.
+• ILB links may include gact_id to show provenance.
+12) Hashing & IDs (DSR-bound)
+• tcaps_id = H( P_touch_caps || canonical(caps_json) ), tag immu.touch.caps.v1.
+• tprof_id = H( P_touch_profile || canonical(profile_json) ), tag immu.touch.profile.v1.
+• tevt_id = H( P_touch_events || canonical(events_json) ), tag immu.touch.events.v1.
+• ttrk_id = H( P_touch_tracks || canonical(tracks_json) ), tag immu.touch.tracks.v1.
+• gmap_id = H( P_touch_gmap || canonical(gmap_json) ), tag immu.touch.gmap.v1.
+• gact_id = H( P_touch_gest || canonical(gest_json) ), tag immu.touch.gest.v1.
+• tcert_id = H( P_touch_cert || canonical(cert_json) ), tag immu.touch.cert.v1.
+All canonical per encoder_id; multihash attestations recommended for evt_set, track_set, gest_set.
+13) Verification Procedure (acceptance)
+Given tcaps_id, tprof_id, tevt_id, ttrk_id, gmap_id, gact_id, tcert_id:
+• Hash/DSR & Policy: recompute; suites OK.
+• Profile adherence: grid matches viewport ref; masks applied; anchors/quant match profile; pressure/tilt policy respected. Else TP_E_PROFILE.
+• Event integrity: evt_set monotone ordering; rate ≤ max_rate_hz; moves split correctly; masked cells omitted. Else TP_E_EVENTS.
+• Track reconstruction: recompute down→up segmentation and features; ensure equality with tracks[]. Else TP_E_TRACKS.
+• Gesture recomputation: run sealed FSM on tracks with gmap.thresholds; ensure equality with gestures[]. Else TP_E_GESTURE.
+• Bind resolution: apply gmap.binds to gestures; cross-check action_ids; ensure no ambiguity. Else TP_E_BINDS.
+• Certificate assertions: recompute booleans; mismatch ⇒ TP_E_CERT_ASSERT.
+Accept iff all pass; otherwise reject with minimal witness (pointer id, gesture id, window index, or first offending event).
+14) Deterministic Errors (reason names)
+• TP_E_SCHEMA — unsupported schema (caps/profile/events/tracks/gmap/gest/cert).
+• TP_E_ENCODER — non-canonical bytes.
+• TP_E_DSR — unknown/missing DSR tag.
+• TP_E_PROFILE — grid/mask/anchor mismatch or forbidden fields enabled.
+• TP_E_EVENTS — rate exceed, masked cell present, or path interpolation mismatch.
+• TP_E_TRACKS — track segmentation/feature mismatch.
+• TP_E_GESTURE — FSM recompute diverges (threshold or tie-break drift).
+• TP_E_BINDS — ambiguous or missing bind for a recognized gesture.
+• TP_E_CERT_ASSERT — asserted flags not satisfied.
+• TP_E_HASH — id mismatch after hashing.
+Each returns a minimal witness (event index, cell, gesture kind and parameter).
+15) Golden Vectors (minimum set)
+Place under golden/touch/v1.1/:
+• Caps-A: generic touch, max_points=5, viewport 1920×1080 VU → tcaps_id.
+• Profile-A: grid 64×36, masks one rectangular area, pressure_bits=0, anchors=ticks → tprof_id.
+• Events-A: (a) single-cell tap at (31,18), (b) swipe right 7 cells within 30 ticks, (c) pinch-in with two pointers → tevt_id with evt_set.
+• Tracks-A: three tracks derived from Events-A; features computed → ttrk_id.
+• GMap-A: thresholds as in §7; binds tap→act_select, swipe right→act_next, pinch-in→act_zoom_in → gmap_id.
+• Gest-A: recognized tap, swipe(right, len=7), pinch(scale_q8=240) with anchors → gact_id.
+• Cert-A: all assertions true → tcert_id.
+• Fail-Mask: event occurs inside masked rect → TP_E_EVENTS.
+• Fail-FSM: change double-tap gap outside range → TP_E_GESTURE.
+• Fail-Bind: remove swipe-right bind → TP_E_BINDS.
+Vectors include canonical bytes hex, preludes, expected digests.
+16) Interaction with Other Planes
+• ILB (Slice 18): Gestures provide E0 anchors & action_ids for latency measurement; cross-link gact_id in ILB records.
+• Admission (Slice 16): Different contexts may allow/forbid gesture families (e.g., pinch disabled in combat UI); admission witnesses show need ≤ ctx for UI actions.
+• OCE (Slice 19): Operator commands that toggle capture/masks can be proven via console transcripts.
+• GDAP/EBC: Unrelated at runtime; touch artifacts are evidence blobs only.
+• Heals (Slice 13): Tracks/gestures can be vacuumed; Heal Cert proves reachable set unchanged.
+17) What this does not change (stability)
+• No changes to interpreter/staged semantics, parity tuple, gas, capability lineage, OML lattice, or effects.
+• No wall-clock or network; all anchors are run-relative.
+• No raw XY stored; only grid cells and optional raw path digest for integrity.
+End of Slice 21.
+Say continue to proceed. Clean follow-ons:
+• Coverage Ledger v1.0 (EP-wide index: artifacts → proofs → certs for one-pass audits),
+• Thermal Budget v1.0 (policy-safe throttling envelopes linked to PCV/Admission), or
+• Audio Output Evidence v1.0 (deterministic mixer snapshots & pattern certs).
+
+
